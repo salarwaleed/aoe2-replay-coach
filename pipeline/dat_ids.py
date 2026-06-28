@@ -9,8 +9,9 @@ common neighbours.
 Categories are deliberately coarse — ``eco`` | ``military`` | ``defensive`` —
 because that is the granularity the telemetry signals care about (see
 TELEMETRY_PLAN.md §5). Anything not in the table resolves to
-``("Unknown(id=N)", "unknown")`` so the pipeline never crashes and unmapped ids
-surface clearly in the rendered logs for later reconciliation.
+``("Unknown", "unknown")`` so the pipeline never crashes; the renderer appends the
+raw id (``Unknown(id=N)``) so unmapped ids still surface clearly in the logs for
+later reconciliation.
 
 Only ids identified with high confidence against canonical AoE2 genie ids are
 named. Genuinely ambiguous ids are left out on purpose — see README "unmapped
@@ -84,7 +85,10 @@ _UNITS: dict[int, tuple[str, str]] = {
     77: ("Two-Handed Swordsman", MILITARY),
     83: ("Villager", ECO),
     93: ("Spearman", MILITARY),
-    101: ("Town Center (unit slot)", ECO),
+    # NOTE: genie id 101 = Stable (a building). It is intentionally NOT in this
+    # units table: it never appears as a QUEUE unit_id in the data (verified 0
+    # occurrences), and including it here previously shadowed the buildings entry
+    # in the merged DAT_IDS, mislabeling BUILD id=101 (Stable, x341) as a TC.
     106: ("Longboat", MILITARY),   # civ unique (Vikings)
     125: ("Monk", MILITARY),
     128: ("Trade Cart", ECO),
@@ -159,6 +163,13 @@ _UNITS: dict[int, tuple[str, str]] = {
     1658: ("Serjeant", MILITARY),           # civ unique (Sicilians)
 }
 
+# Guard against a building id and a unit id colliding: a single flat lookup
+# cannot serve two different names for the same genie id, and a silent dict-merge
+# override is exactly the bug that mislabeled BUILD id=101. If you ever need an id
+# in both tables, the parser must disambiguate by action kind instead.
+_COLLISIONS = set(_BUILDINGS) & set(_UNITS)
+assert not _COLLISIONS, f"dat_ids: id(s) defined in both buildings and units: {sorted(_COLLISIONS)}"
+
 # Public table: union of buildings and units.
 DAT_IDS: dict[int, tuple[str, str]] = {**_BUILDINGS, **_UNITS}
 
@@ -166,15 +177,18 @@ DAT_IDS: dict[int, tuple[str, str]] = {**_BUILDINGS, **_UNITS}
 def get_obj(obj_id: int | None) -> tuple[str, str]:
     """Resolve a raw genie object id to ``(name, category)``.
 
-    Returns ``("Unknown(id=N)", "unknown")`` for unmapped (or ``None``) ids so
-    callers never have to special-case missing data.
+    Returns a **bare** name (no embedded id) — e.g. ``("Mill", "eco")`` or
+    ``("Unknown", "unknown")`` for unmapped (or ``None``) ids. The numeric id is
+    appended once by the renderer (``render_event_line``), which keeps mapped and
+    unmapped ids formatted consistently as ``Name(id=N)`` and avoids the
+    double-id render (``Unknown(id=N)(id=N)``).
     """
     if obj_id is None:
-        return ("Unknown(id=None)", UNKNOWN)
+        return ("Unknown", UNKNOWN)
     mapped = DAT_IDS.get(obj_id)
     if mapped is not None:
         return mapped
-    return (f"Unknown(id={obj_id})", UNKNOWN)
+    return ("Unknown", UNKNOWN)
 
 
 def is_building(obj_id: int) -> bool:

@@ -29,16 +29,31 @@ pipeline/pipeline1_ingest.py      orchestrator (python -m pipeline.pipeline1_ing
 
 ## How to run
 
+> **Always install pipeline deps into the dedicated `.venv`, never globally.**
+> `chromadb` pulls in a newer `click` (8.2+) that breaks the bot's `gtts 2.5.4`
+> (which needs `click<8.2`). The `.venv` keeps the pipeline fully isolated from
+> the bot's global environment. `.venv` is gitignored.
+
 ```bash
 # 1. start ChromaDB (from the worktree root)
 docker compose -f infra/docker-compose.yml up -d
 
-# 2. install the pipeline dependency (mgz==1.8.51 already installed; do not upgrade)
-pip install -r pipeline/requirements.txt
+# 2. create + activate the dedicated pipeline virtualenv (one-time setup)
+python -m venv .venv
+source .venv/Scripts/activate     # Windows (Git Bash)
+# .venv\Scripts\activate          #   (PowerShell / cmd)
+# source .venv/bin/activate       # macOS / Linux
 
-# 3. run the ingestion
+# 3. install the pipeline deps INTO the venv (chromadb + the pinned mgz)
+pip install -r pipeline/requirements.txt mgz==1.8.51
+
+# 4. run the ingestion (inside the activated venv)
 python -m pipeline.pipeline1_ingest
 ```
+
+After the first setup, only steps 1 (if the container is down), activate, and 4
+are needed. Equivalently, call the venv interpreter directly without activating:
+`.venv/Scripts/python.exe -m pipeline.pipeline1_ingest`.
 
 The run prints per-file results and a summary (files parsed/skipped, chunks
 upserted, final `collection.count()`). If ChromaDB is unreachable you get a clear
@@ -107,9 +122,7 @@ Two reference signals ship in `signals/reference.py`:
 ## Unmapped DAT ids to resolve
 
 `dat_ids.py` maps the BUILD/QUEUE ids observed across the 22 readable replays. The
-following ids were observed but are **not yet confidently mapped** — they resolve
-to `Unknown(id=N)` and are listed here for later reconciliation (likely DE-era /
-v1.6 unit & building ids; names were left out deliberately rather than guessed).
+following ids resolve to `Unknown(id=N)` and are listed for later reconciliation.
 Counts are total occurrences across all replays.
 
 **Unmapped BUILD ids:** `665` (x5), `673` (x13), `796` (x2), `1384` (x321),
@@ -118,11 +131,25 @@ Counts are total occurrences across all replays.
 **Unmapped QUEUE ids:** `823` (x11), `873` (x25), `1473` (x145), `1524` (x263),
 `1526` (x64), `1549` (x148), `2669` (x1), `2677` (x891), `2804` (x10)
 
-The high-frequency ones worth resolving first: **`2677` (x891)** — by volume the
-most-trained unit after villager/spearman/scout/knight — and BUILD **`1384`
-(x321)**, comparable in count to Town Centers. These almost certainly correspond
-to v1.6/DE units & buildings; mapping them needs the v1.6 genie object table,
-which is not bundled with `mgz`.
+A note on the genie object table: the `aocref` package (an `mgz` dependency, so
+available in the `.venv`) ships per-dataset object id→name maps under
+`aocref/data/datasets/*.json`. Dataset `100` (Definitive Edition) is the closest
+match and resolves some of the above — e.g. `1384` / `1385` = **Sea Gate**. It is
+**not a perfect match** for this UserPatch v1.6 build, though: several ids it does
+name conflict with the observed action semantics/frequencies (e.g. it labels id
+`621` "Town Center" though it appears here as a frequent gate-like BUILD; id
+`2677` is absent from it entirely). Because of that mismatch these names were
+**not auto-adopted** — adopting them wholesale would trade hand-guesses for
+dataset-guesses on an imperfect match. Resolving them properly means confirming
+the actual genie DAT for this Voobly build. The high-value targets: **`2677`
+(x891)**, the most-trained unit after villager/spearman/scout/knight, and BUILD
+**`1384` (x321)** (`aocref`: Sea Gate).
+
+> The id→name table was validated against `aocref` dataset 100 during this pass.
+> That caught a real bug: genie id `101` is **Stable**, but a stray units-table
+> entry was shadowing it in the merged lookup and mislabeling BUILD `id=101` as a
+> Town Center. Fixed, with an assertion guarding against future building/unit id
+> collisions.
 
 ## Open question for the supervisor
 
