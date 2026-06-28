@@ -19,6 +19,8 @@ env/
 profiles.json
 infra/chroma-data/
 **/chroma-data/
+infra/dynamo-data/
+**/dynamo-data/
 
 # ── OS / editor ──────────────────────────────────────────────────────────
 .DS_Store
