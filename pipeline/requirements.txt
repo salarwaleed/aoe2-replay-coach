@@ -6,3 +6,12 @@
 # chromadb bundles its default embedding function (all-MiniLM-L6-v2), so no API
 # key or extra model download configuration is required.
 chromadb
+
+# Pipeline 2 — Telemetry & Timelines dependencies.
+#
+# boto3 talks to DynamoDB (local via DynamoDB Local, or real AWS — see
+# pipeline/config.py). requests calls the local Ollama HTTP API directly
+# (no ollama pkg needed); already pulled in transitively but listed
+# explicitly since pipeline2 depends on it directly.
+boto3
+requests

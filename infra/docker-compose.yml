@@ -1,10 +1,12 @@
-# ChromaDB staging store for Pipeline 1 (raw match-log ingestion).
+# Local dev infrastructure for the AoE2 telemetry pipelines.
 #
 #   docker compose -f infra/docker-compose.yml up -d
 #   docker compose -f infra/docker-compose.yml down
 #
-# Data persists in ./chroma-data (gitignored). The pipeline connects over HTTP at
-# localhost:8000 (see pipeline/config.py).
+#   * chromadb        — Pipeline 1 staging store (raw match-log chunks), :8000
+#   * dynamodb-local  — Pipeline 2 timeline store (DynamoDB Local),      :8001
+#
+# Data persists in ./chroma-data and ./dynamo-data (both gitignored).
 
 services:
   chromadb:
@@ -17,4 +19,23 @@ services:
     environment:
       IS_PERSISTENT: "TRUE"
       ANONYMIZED_TELEMETRY: "FALSE"
+    restart: unless-stopped
+
+  # DynamoDB Local — a drop-in local implementation of the DynamoDB API. The
+  # pipeline talks to it via boto3 with endpoint_url=http://localhost:8001; the
+  # SAME code points at real AWS when that endpoint_url is removed (see
+  # pipeline/config.py DYNAMODB_ENDPOINT_URL).
+  #
+  # -sharedDb keeps a single shared database file regardless of credentials/region
+  # so data is stable across runs; -dbPath persists it to the mounted volume.
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: aoe-dynamodb
+    ports:
+      - "8001:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    working_dir: /home/dynamodblocal
+    volumes:
+      - ./dynamo-data:/home/dynamodblocal/data
+    user: root
     restart: unless-stopped
