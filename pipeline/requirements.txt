@@ -1,0 +1,8 @@
+# Pipeline 1 — Raw Ingestion dependencies.
+#
+# mgz==1.8.51 is assumed already installed (do not upgrade) and is intentionally
+# NOT pinned here so this file does not trigger a reinstall.
+#
+# chromadb bundles its default embedding function (all-MiniLM-L6-v2), so no API
+# key or extra model download configuration is required.
+chromadb

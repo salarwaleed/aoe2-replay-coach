@@ -1,0 +1,20 @@
+# ChromaDB staging store for Pipeline 1 (raw match-log ingestion).
+#
+#   docker compose -f infra/docker-compose.yml up -d
+#   docker compose -f infra/docker-compose.yml down
+#
+# Data persists in ./chroma-data (gitignored). The pipeline connects over HTTP at
+# localhost:8000 (see pipeline/config.py).
+
+services:
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: aoe-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./chroma-data:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    restart: unless-stopped
