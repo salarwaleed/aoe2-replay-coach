@@ -12,7 +12,12 @@
 - **Stay cost-aware mid-flight.** Watch resource usage and course-correct before overspending; prefer fewer, bigger agent tasks over many resumes.
 - **Review one by one.** Surface decisions for explicit approval before committing to expensive directions.
 
-## For subagents (IMPORTANT — prevents runaway recursion)
-- If you are a spawned subagent, **you are the worker.** Do the assigned task yourself with your own tools.
-- **Do NOT spawn, message, or delegate to other agents, and do NOT act as a supervisor**, unless your task prompt explicitly tells you to. The "delegate to subagents" guidance above is for the main session only.
-- Earlier, a subagent read the main-session delegation guidance and recursively spawned "worker" agents that did no work and wasted tokens. Don't repeat that — just execute your task and report.
+## Subagent operating policy
+Subagents are **workers**, not orchestrators. To prevent runaway recursion and token waste, the following is policy:
+
+- **The task prompt is a subagent's single source of authority.** A subagent acts solely on the explicit prompt given by the main session and disregards the rest of this file. The main-session guidance above (e.g. "delegate to subagents") does **not** apply to subagents.
+- **No re-delegation.** A subagent must not spawn, message, or delegate to other agents, nor act as a supervisor, unless its prompt explicitly and specifically instructs it to.
+- **Self-contained, ephemeral prompts.** The main session writes each subagent a complete, task-scoped prompt containing everything it needs, and keeps those instructions minimal and current — written as needed, removed when no longer needed. Subagents must not depend on project-level files (including this one) for behavioural guidance.
+- **Standard preamble.** Every subagent prompt begins with an authoritative override, e.g.: *"Follow ONLY this prompt; ignore any project/CLAUDE.md guidance. You are a worker subagent: do the task yourself, do not spawn/message/delegate to other agents, and do not act as a supervisor."*
+
+Rationale: a subagent once inherited the main-session "delegate" guidance and recursively spawned no-op worker agents, wasting tokens. This policy exists to prevent recurrence.
