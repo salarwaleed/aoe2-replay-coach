@@ -1,0 +1,27 @@
+# ── Secrets (NEVER commit) ───────────────────────────────────────────────
+.env
+**/.env
+discord token.txt
+**/discord token.txt
+*.key
+*.pem
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Runtime / data artifacts ─────────────────────────────────────────────
+*.log
+profiles.json
+infra/chroma-data/
+**/chroma-data/
+
+# ── OS / editor ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
