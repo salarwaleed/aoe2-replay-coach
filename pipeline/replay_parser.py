@@ -41,6 +41,7 @@ from mgz.fast import parse_action, sync as fast_sync
 from mgz.fast.enums import Action, Operation
 
 from . import dat_ids
+from .civ_ids import CIV_ID_TO_NAME
 from .config import UNATTRIBUTED_PLAYER_ID
 
 # Voobly anti-cheat heartbeat injected into the action stream.
@@ -118,127 +119,228 @@ def _read_raw(path_or_raw: str | bytes) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Player-name recovery (best effort)
+# Player-name / civ / color recovery (best effort)
 # ─────────────────────────────────────────────────────────────────────────────
+# Empirically observed value of the per-player ``num_header_data`` field for
+# these Voobly v1.6 recordings. When it holds, the civ/color/spawn block sits at
+# a fixed offset from the start of the player's stats block (see
+# ``_PS_BLOCK_OFFSET`` below). When a file has a different value we fall back to
+# scanning a window for a block that passes the sanity checks.
+_EXPECTED_NUM_HEADER_DATA = 478
+# Offset (in bytes) from ``ps_start`` to the civ/color/spawn block, valid when
+# ``num_header_data == _EXPECTED_NUM_HEADER_DATA``.
+_PS_BLOCK_OFFSET = 1925
+# Fallback scan window (relative to ps_start) used when num_header_data differs
+# from the expected value.
+_PS_SCAN_START = 1700
+_PS_SCAN_END = 2200
+_MAP_COORD_MAX = 300
+
+
+def _decompress_header(raw: bytes) -> bytes | None:
+    """Best-effort raw-DEFLATE decompress of the replay header.
+
+    Voobly headers are raw DEFLATE streams (no zlib wrapper); the stream start
+    offset varies a little by build, so a few plausible starts are tried.
+    """
+    if len(raw) < 4:
+        return None
+    header_len = struct.unpack("<I", raw[:4])[0]
+    for start in (8, 4, 12):
+        try:
+            return zlib.decompress(raw[start : 4 + header_len], -zlib.MAX_WBITS)
+        except zlib.error:
+            continue
+    return None
+
+
+def _find_name_candidates(data: bytes) -> list[tuple[int, str]]:
+    """Find ``player_name`` occurrences inside the header's ``attributes`` struct.
+
+    Each candidate is an Int16ul length field (``name_len`` including the
+    terminator) immediately followed by ASCII text of length ``name_len - 1``,
+    then a ``0x00`` terminator byte. Returns ``(name_text_offset, name)`` pairs in
+    header order, excluding the synthetic ``GAIA`` player.
+    """
+    n = len(data)
+    out: list[tuple[int, str]] = []
+    i = 0
+    while i < n - 2:
+        ln = struct.unpack_from("<H", data, i)[0]
+        if 2 <= ln <= 24:
+            s = data[i + 2 : i + 2 + ln - 1]
+            term_ok = (i + 2 + ln - 1) < n and data[i + 2 + ln - 1] == 0
+            if (
+                term_ok
+                and len(s) == ln - 1
+                and all(32 <= b < 127 for b in s)
+                and any(chr(b).isalnum() for b in s)
+            ):
+                name = s.decode("ascii")
+                # Reject very short / mostly-non-alphanumeric runs: these are
+                # spurious matches against binary noise elsewhere in the header
+                # (e.g. a lone "R") rather than real player handles, and can
+                # coincidentally pass the downstream civ/color/spawn sanity
+                # checks too. Real handles in practice are >= 2 chars.
+                alnum = sum(1 for b in s if chr(b).isalnum())
+                if name.upper() != "GAIA" and len(s) >= 2 and alnum >= 2:
+                    out.append((i + 2, name))
+        i += 1
+    return out
+
+
+def _parse_player_stats(data: bytes, name_off: int, namelen_field_off: int) -> dict | None:
+    """Walk forward from a confirmed player-name occurrence to recover the
+    civilization id, player color, and spawn location from the per-player
+    ``player_stats`` block. Returns ``None`` if the walk runs out of bounds or
+    the recovered ``num_header_data`` is implausible.
+    """
+    n = len(data)
+    namelen = struct.unpack_from("<H", data, namelen_field_off)[0]
+    pos = name_off + (namelen - 1)
+    try:
+        pos += 1  # pad 0x00
+        pos += 1  # pad 0x16
+        if pos + 4 > n:
+            return None
+        num_header_data = struct.unpack_from("<I", data, pos)[0]
+        ps_start = pos + 4 + 1  # +4 for the u32 field itself, +1 for pad 0x21
+        if not (0 <= num_header_data <= 2000):
+            return None
+
+        offsets: list[int]
+        if num_header_data == _EXPECTED_NUM_HEADER_DATA:
+            offsets = [_PS_BLOCK_OFFSET]
+        else:
+            offsets = list(range(_PS_SCAN_START, _PS_SCAN_END))
+
+        for off in offsets:
+            block_pos = ps_start + off
+            rec = _try_parse_ps_block(data, block_pos)
+            if rec is not None:
+                return rec
+        return None
+    except (struct.error, IndexError):
+        return None
+
+
+def _try_parse_ps_block(data: bytes, pos: int) -> dict | None:
+    """Parse and sanity-check an 11-byte civ/color/spawn block at ``pos``."""
+    n = len(data)
+    if pos < 0 or pos + 11 > n:
+        return None
+    try:
+        spawn_x = struct.unpack_from("<H", data, pos)[0]
+        spawn_y = struct.unpack_from("<H", data, pos + 2)[0]
+        culture = data[pos + 4]
+        civ = data[pos + 5]
+        game_status = data[pos + 6]
+        resigned = data[pos + 7]
+        # data[pos + 8] is an unused pad byte.
+        color = data[pos + 9]
+    except (struct.error, IndexError):
+        return None
+
+    if not (0 < spawn_x < _MAP_COORD_MAX and 0 < spawn_y < _MAP_COORD_MAX):
+        return None
+    if not (0 <= civ <= 90):
+        return None
+    if not (0 <= color <= 7):
+        return None
+
+    return {
+        "civ_id": civ,
+        "civ_name": CIV_ID_TO_NAME.get(civ, f"Civ{civ}"),
+        "color": color,
+        "culture": culture,
+        "spawn": (spawn_x, spawn_y),
+        "game_status": game_status,
+        "resigned": resigned,
+    }
+
+
+def _extract_player_records(header: bytes) -> list[dict]:
+    """Recover per-player ``{name, civ_id, civ_name, color, ...}`` records from a
+    decompressed header, in header (i.e. slot) order, de-duplicated by name.
+    """
+    records: list[dict] = []
+    seen_names: set[str] = set()
+    for name_off, name in _find_name_candidates(header):
+        if name in seen_names:
+            continue
+        namelen_field_off = name_off - 2
+        rec = _parse_player_stats(header, name_off, namelen_field_off)
+        if rec is None:
+            continue
+        seen_names.add(name)
+        records.append({"name": name, **rec})
+    return records
+
+
 def resolve_players(path_or_raw: str | bytes) -> dict[int, str]:
     """Best-effort recovery of ``{player_id: name}`` from the replay header.
 
-    Approach attempted
-    ------------------
-    The structured header parser fails, but the header *does* zlib-decompress
-    cleanly (raw DEFLATE, no zlib wrapper). We decompress it and scan the decoded
-    bytes for printable, name-shaped strings in the early player-metadata region.
+    The structured ``mgz`` header parser fails on these Voobly VER 9.F files, but
+    the header does zlib-decompress cleanly (raw DEFLATE, no zlib wrapper). We
+    decompress it, locate each player's ``name`` field inside the ``attributes``
+    struct, and walk forward through the known struct layout to the per-player
+    stats block to recover real names (and, via :func:`resolve_player_civs`,
+    civ/color/spawn).
 
-    Reliability — IMPORTANT
-    -----------------------
-    In practice this turned out to be **unreliable** for these Voobly VER 9.F
-    files: the player-name region of the decompressed header is interleaved with
-    binary player-data, and the Voobly mod's altered layout means a byte scan
-    pulls back short mojibake runs (e.g. ``'(<A'``, ``'E6>'``) rather than real
-    names. Emitting those would be worse than no name at all, so the scanner is
-    intentionally **strict**: a candidate must look like a plausible handle
-    (letters, sane length, mostly-alphabetic). When nothing passes — which is the
-    common case here — we fall back cleanly to ``{pid: f"Player {pid}"}`` for the
-    standard 1..8 slots.
-
-    The fallback is the expected outcome for most files; real names will only be
-    recovered properly once the structured header is understood for this Voobly
-    build. Downstream code treats these names as best-effort *metadata only*,
-    never as keys (the keys are always numeric player ids).
+    Falls back to ``{pid: f"Player {pid}"}`` for the standard 1..8 slots
+    whenever recovery fails for any reason — this function must never raise.
 
     Returns
     -------
     ``{player_id: name}`` for ids 1..8.
     """
     fallback = {pid: f"Player {pid}" for pid in range(1, 9)}
-
     try:
         raw = _read_raw(path_or_raw)
-        header_len = struct.unpack("<I", raw[:4])[0]
-        # Voobly headers are raw DEFLATE streams; the stream may start a few
-        # bytes in (after a save-meta int) depending on the build, so try a few
-        # plausible offsets.
-        header: bytes | None = None
-        for start in (8, 4, 12):
-            try:
-                header = zlib.decompress(raw[start : 4 + header_len], -zlib.MAX_WBITS)
-                break
-            except zlib.error:
-                continue
+        header = _decompress_header(raw)
         if header is None:
             return fallback
 
-        names = _scan_player_names(header)
-        if not names:
+        records = _extract_player_records(header)
+        if not records:
             return fallback
 
         resolved = dict(fallback)
-        for pid, name in zip(range(1, 9), names):
-            resolved[pid] = name
+        for pid, rec in zip(range(1, 9), records):
+            resolved[pid] = rec["name"]
         return resolved
     except Exception:
         # Name recovery must never break ingestion.
         return fallback
 
 
-def _looks_like_name(text: str) -> bool:
-    """Strict filter: does ``text`` plausibly look like a player handle?
+def resolve_player_civs(path_or_raw: str | bytes) -> dict[int, dict]:
+    """Best-effort recovery of ``{player_id: {civ_id, civ_name, color, ...}}``.
 
-    Deliberately conservative — we would rather return nothing (and let the
-    ``Player N`` fallback apply) than surface binary mojibake as a "name".
+    Companion to :func:`resolve_players`, built from the same header walk.
+    Players for whom the civ/color/spawn block could not be recovered (or for
+    slots beyond the number of header records found) are simply absent from the
+    returned dict — callers should treat a missing key as "unknown".
+
+    Returns
+    -------
+    ``{player_id: {civ_id, civ_name, color, culture, spawn, game_status,
+    resigned}}`` for whichever of ids 1..8 were successfully recovered.
     """
-    if not (3 <= len(text) <= 20):
-        return False
-    letters = sum(c.isalpha() for c in text)
-    # Require it to be mostly letters/spaces — handles can contain digits and a
-    # few symbols, but a real name is not majority punctuation.
-    if letters < max(3, len(text) * 0.6):
-        return False
-    # Reject runs containing characters typical of binary noise.
-    if any(c in text for c in "{}[]<>\\|`~^"):
-        return False
-    return True
+    try:
+        raw = _read_raw(path_or_raw)
+        header = _decompress_header(raw)
+        if header is None:
+            return {}
 
-
-def _scan_player_names(header: bytes) -> list[str]:
-    """Pull candidate player-name strings from a decompressed header.
-
-    Returns plausible, de-duplicated name runs in order. Returns an empty list
-    when nothing convincing is found (the common case for these files), which
-    triggers the clean ``Player N`` fallback in :func:`resolve_players`.
-    """
-    candidates: list[str] = []
-    seen: set[str] = set()
-    run = bytearray()
-
-    def flush() -> None:
-        if run:
-            try:
-                text = run.decode("latin-1").strip()
-            except UnicodeDecodeError:
-                run.clear()
-                return
-            if (
-                text
-                and text not in seen
-                and not text.startswith("VER ")
-                and text not in {"Player"}
-                and _looks_like_name(text)
-            ):
-                seen.add(text)
-                candidates.append(text)
-        run.clear()
-
-    # Player metadata lives early in the header; limit the scan to avoid map and
-    # scenario strings deeper in the structure.
-    for byte in header[:4096]:
-        if 0x20 <= byte <= 0x7E:
-            run.append(byte)
-        else:
-            flush()
-    flush()
-
-    return candidates
+        records = _extract_player_records(header)
+        civs: dict[int, dict] = {}
+        for pid, rec in zip(range(1, 9), records):
+            civs[pid] = {k: v for k, v in rec.items() if k != "name"}
+        return civs
+    except Exception:
+        # Civ recovery must never break ingestion.
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,6 +474,7 @@ def parse_match_timeline(path: str) -> dict:
         "duration_sync_ms": total_ms,
         "complete": postgame_complete,
         "players": resolve_players(raw),
+        "player_civs": resolve_player_civs(raw),
         "events": events,
     }
 
@@ -449,6 +552,15 @@ def _hms_to_seconds(text: object) -> int:
     return seconds
 
 
+def _fix_wall_coord(v: int) -> int:
+    """Undo the vendored ``mgz`` library's signed-byte wraparound for WALL tile
+    coordinates: any coordinate past tile 127 is read back as negative (e.g.
+    ``-64`` instead of ``192``). We do not patch ``mgz`` itself — this is a local
+    correction applied only when building the WALL event's ``extras``.
+    """
+    return v + 256 if v < 0 else v
+
+
 def _append_event(
     events: list[dict], action_type: Action, payload: dict, t_ms: int
 ) -> None:
@@ -469,7 +581,20 @@ def _append_event(
         obj_id = payload.get("building_id")
         if obj_id is not None:
             obj_name, category = dat_ids.get_obj(obj_id)
-        if "x" in payload and "y" in payload:
+        if action_type == Action.WALL:
+            # The vendored mgz library reads WALL tile coordinates as signed
+            # bytes, so any coordinate past tile 127 wraps negative. Correct it
+            # locally here (see _fix_wall_coord) without patching mgz.
+            if "x" in payload and "y" in payload:
+                extras["pos"] = [
+                    _fix_wall_coord(payload["x"]),
+                    _fix_wall_coord(payload["y"]),
+                ]
+            if "x_end" in payload:
+                extras["x_end"] = _fix_wall_coord(payload["x_end"])
+            if "y_end" in payload:
+                extras["y_end"] = _fix_wall_coord(payload["y_end"])
+        elif "x" in payload and "y" in payload:
             extras["pos"] = [round(payload["x"], 1), round(payload["y"], 1)]
 
     elif action_type in (Action.QUEUE, Action.MULTIQUEUE):

@@ -131,6 +131,7 @@ def ingest_match(collection, match: dict, ingested_at: str) -> int:
     """
     match_id = match["match_id"]
     players = match["players"]
+    player_civs = match.get("player_civs") or {}
     by_player = group_by_player(match["events"])
 
     ids: list[str] = []
@@ -140,8 +141,10 @@ def ingest_match(collection, match: dict, ingested_at: str) -> int:
     for player_id, p_events in sorted(by_player.items()):
         if player_id == UNATTRIBUTED_PLAYER_ID:
             player_name = "Unattributed"
+            civ_name = ""
         else:
             player_name = players.get(player_id, f"Player {player_id}")
+            civ_name = player_civs.get(player_id, {}).get("civ_name", "")
         for chunk_idx, chunk in enumerate(chunk_events(p_events, CHUNK_SIZE)):
             lines = [render_event_line(ev) for ev in chunk]
             chunk_text = "\n".join(lines)
@@ -152,6 +155,7 @@ def ingest_match(collection, match: dict, ingested_at: str) -> int:
                     "match_id": match_id,
                     "player_id": player_id,
                     "player_name": player_name,
+                    "civ_name": civ_name,
                     "t_start_ms": chunk[0]["t_ms"],
                     "t_end_ms": chunk[-1]["t_ms"],
                     "n_events": len(chunk),
