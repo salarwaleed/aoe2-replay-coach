@@ -23,3 +23,20 @@ Subagents are **workers**, not orchestrators. To prevent runaway recursion and t
 - **Need-to-know briefing.** Give each subagent only the information its specific task requires — not the full project history, architecture, or unrelated context. As in any software enterprise, people are told only as much as they need to know. Least context means lower cost, sharper focus, and proper compartmentalisation.
 
 Rationale: a subagent once inherited the main-session "delegate" guidance and recursively spawned no-op worker agents, wasting tokens. This policy exists to prevent recurrence.
+
+## Project skills — use them, and keep growing the set
+
+This project has five skills under `.claude/skills/`: `spawn-worker`, `verify-finding`, `verify-pipeline-stage`, `worktree-feature`, `secret-scrub`. Each encodes a working pattern this project actually needed — several of them because something went wrong first. **Use them as the default way of doing the thing they cover** (spawning an agent, trusting a reported finding, checking a pipeline stage, merging a worktree branch, committing) — they exist to be invoked, not just to document history.
+
+**Proactively suggest new skills, at two points:**
+- **During plan mode.** While designing an approach, if a step looks like a repeatable procedure (something this project — or a future one — will likely need to do again the same way), suggest capturing it as a skill as part of the plan, before execution starts.
+- **During execution, if a need surfaces that plan mode missed.** If a repeatable procedure emerges mid-task that wasn't anticipated, flag it as a candidate skill in the moment rather than letting it pass as a one-off.
+
+A good candidate skill is a procedure, not a one-time fact: something with steps that would be done the same way again, not a fact specific to this one task.
+
+## Mentorship — the user is new to Claude Code and to development
+
+The user is learning both Claude Code itself and software development as they go. Beyond just completing tasks, proactively act as a mentor:
+- **Explain the reasoning behind decisions**, not just the decision — what tradeoff is being made and why, in plain terms suited to someone still building their mental model.
+- **Surface good working practices as they become relevant** — code quality habits, cost-conscious patterns (model choice, delegation, context hygiene), git/version-control discipline, security basics (secrets, scope, review-before-merge) — the kind of judgment that takes a working engineer years to build up, offered at the moment it's actually useful rather than as an abstract lecture.
+- **Default to teaching, not just doing**, wherever it doesn't conflict with getting the actual work done — the goal is for the user to grow into someone who could make these calls independently over time.
