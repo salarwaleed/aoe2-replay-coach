@@ -11,6 +11,7 @@
 - **Save early; nothing unsafe.** Commit progress proactively (especially before resources run low); keep the git tree clean and recoverable at all times.
 - **Stay cost-aware mid-flight.** Watch resource usage and course-correct before overspending; prefer fewer, bigger agent tasks over many resumes.
 - **Review one by one.** Surface decisions for explicit approval before committing to expensive directions.
+- **Verify findings independently, never use verbatim.** When a subagent (or any source, including inherited code/data from outside this project) reports a finding, a table, an extracted value, or a "ground truth," do not accept it at face value or copy it through unverified. Cross-check it against an independent source, a cheap sanity test, or another agent before relying on it or building further on top of it. This applies especially to data copied from elsewhere (e.g. a lookup table pulled from another file) — copying it is not the same as validating it. A real bug (an alphabetically-ordered civilization id table, copied verbatim and silently wrong) reached production this way; this rule exists to prevent recurrence.
 
 ## Subagent operating policy
 Subagents are **workers**, not orchestrators. To prevent runaway recursion and token waste, the following is policy:
