@@ -92,14 +92,14 @@ built on BUILD. **This needs a supervisor decision** — see "Open question" bel
 
 ### Player names — `resolve_players()` reliability
 
-`resolve_players()` is **best effort and currently falls back cleanly**. The
-header zlib-decompresses fine, but its player-name region is interleaved with
-binary player-data under the Voobly mod's altered layout, so a byte scan only
-recovers mojibake. Rather than surface garbage, the scanner is strict and, when
-nothing convincing passes, returns `{pid: "Player N"}` for slots 1..8 — which is
-the outcome for **all current files**. Real names will require decoding the
-structured header for this specific Voobly build; until then `player_id` (numeric)
-is the reliable key and `player_name` is best-effort metadata only.
+`resolve_players()` now recovers **real names, civs, colors, and spawn** from
+the VER 9.F header (decoded per `docs/header_decode`) — verified 100% across
+all 22 readable replays (see commit `381e8b4`). The header zlib-decompresses
+fine; the per-player `attributes` struct is located and walked forward to the
+stats block to pull real values. It still falls back to `{pid: "Player N"}`
+for any slot it can't confidently resolve, so callers should not assume every
+slot is a real name, but `player_id` (numeric) remains the reliable join key
+regardless.
 
 ## Extending: adding a telemetry signal
 
