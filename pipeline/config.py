@@ -89,3 +89,50 @@ OLLAMA_TIMEOUT: float = float(os.environ.get("OLLAMA_TIMEOUT", "120"))
 
 # Suggested small models if none are installed (printed by llm_extract).
 OLLAMA_SUGGESTED_MODELS: tuple[str, ...] = ("llama3.2", "qwen2.5:3b")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Pipeline 3 — Player Profiling
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Ollama (profile synthesis) ──────────────────────────────────────────────
+# Synthesis is a genuinely creative/analytical task (unlike pipeline 2's
+# mechanical sentence rewriting), so it uses a larger model and is NOT given a
+# deterministic fallback — if the model isn't ready, profile_synth raises a
+# clear typed error rather than faking a profile.
+PROFILE_OLLAMA_MODEL: str = os.environ.get("PROFILE_OLLAMA_MODEL", "qwen2.5:7b")
+# Low-moderate temperature: some synthesis/judgement is wanted, but we still
+# want a grounded, repeatable-ish read rather than creative invention.
+PROFILE_OLLAMA_TEMPERATURE: float = float(
+    os.environ.get("PROFILE_OLLAMA_TEMPERATURE", "0.3")
+)
+# Synthesis prompts are much longer than pipeline 2's per-chunk prompts (a
+# whole player's event history across matches), so the timeout is generous.
+PROFILE_OLLAMA_TIMEOUT: float = float(os.environ.get("PROFILE_OLLAMA_TIMEOUT", "600"))
+
+# ── S3 / MinIO (profile storage) ─────────────────────────────────────────────
+# All access goes through boto3 with a configurable endpoint_url — THE KEY
+# DESIGN POINT (same pattern as DynamoDB above): identical code runs locally
+# against MinIO and in the cloud against real AWS S3.
+#
+#   * Local dev (default): S3_ENDPOINT_URL points at the MinIO container
+#     (Docker, host port 9000) with dummy/local credentials. No real AWS
+#     account used. MinIO's web console is at http://localhost:9001.
+#   * Real AWS: set S3_ENDPOINT_URL="" (empty) and provide real credentials
+#     via the standard AWS mechanisms (env vars, ~/.aws/credentials, IAM
+#     role). When the endpoint is empty, boto3 talks to the real regional S3
+#     endpoint and the rest of the code (s3_store.py) is unchanged.
+#
+# An empty/whitespace env value is treated as "use real AWS" (endpoint_url=None).
+_raw_s3_endpoint: str = os.environ.get("S3_ENDPOINT_URL", "http://localhost:9000")
+S3_ENDPOINT_URL: str | None = _raw_s3_endpoint.strip() or None
+
+S3_BUCKET_NAME: str = os.environ.get("S3_BUCKET_NAME", "player-profiles")
+
+# Dummy credentials used ONLY when talking to local MinIO (must match
+# infra/docker-compose.yml's MINIO_ROOT_USER/MINIO_ROOT_PASSWORD). Never used
+# against real AWS (real creds come from the environment/IAM role).
+S3_LOCAL_ACCESS_KEY_ID: str = os.environ.get("S3_ACCESS_KEY_ID", "localadmin")
+S3_LOCAL_SECRET_ACCESS_KEY: str = os.environ.get(
+    "S3_SECRET_ACCESS_KEY", "localpassword123"
+)
