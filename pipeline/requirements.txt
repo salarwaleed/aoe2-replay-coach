@@ -15,3 +15,9 @@ chromadb
 # explicitly since pipeline2 depends on it directly.
 boto3
 requests
+
+# Pipeline 3 — Player Profiling dependencies.
+#
+# Reuses boto3 (now also talks to MinIO/S3 — see pipeline/s3_store.py) and
+# requests (calls Ollama's /api/generate directly, same as pipeline 2). No
+# new packages required.

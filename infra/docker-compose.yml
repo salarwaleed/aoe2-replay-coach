@@ -5,8 +5,10 @@
 #
 #   * chromadb        — Pipeline 1 staging store (raw match-log chunks), :8000
 #   * dynamodb-local  — Pipeline 2 timeline store (DynamoDB Local),      :8001
+#   * minio           — Pipeline 3 profile store (S3-compatible),       :9000
+#                        (console UI at :9001, login localadmin/localpassword123)
 #
-# Data persists in ./chroma-data and ./dynamo-data (both gitignored).
+# Data persists in ./chroma-data, ./dynamo-data, and ./minio-data (all gitignored).
 
 services:
   chromadb:
@@ -38,4 +40,23 @@ services:
     volumes:
       - ./dynamo-data:/home/dynamodblocal/data
     user: root
+    restart: unless-stopped
+
+  # MinIO — a drop-in local implementation of the S3 API. Pipeline 3 talks to
+  # it via boto3 with endpoint_url=http://localhost:9000 (default config in
+  # pipeline/config.py S3_ENDPOINT_URL); the SAME code points at real AWS S3
+  # when that endpoint_url is removed (set S3_ENDPOINT_URL="" and provide real
+  # AWS credentials — no code changes needed).
+  minio:
+    image: minio/minio
+    container_name: aoe-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    environment:
+      MINIO_ROOT_USER: localadmin
+      MINIO_ROOT_PASSWORD: localpassword123
+    volumes:
+      - ./minio-data:/data
     restart: unless-stopped

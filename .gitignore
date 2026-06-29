@@ -21,6 +21,8 @@ infra/chroma-data/
 **/chroma-data/
 infra/dynamo-data/
 **/dynamo-data/
+infra/minio-data/
+**/minio-data/
 
 # ── OS / editor ──────────────────────────────────────────────────────────
 .DS_Store

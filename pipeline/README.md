@@ -161,3 +161,87 @@ per-player spine for v1 and treat QUEUE as match-level aggregate; (b) investigat
 whether forcing mgz's DE/71094 action path (which *does* attribute every action)
 applies to this Voobly build; (c) reconstruct ownership via a fuller game-state
 walk. Needs your call.
+
+---
+
+# Pipeline 3 — Player Profiling (DynamoDB timelines ➜ Ollama synthesis ➜ MinIO/S3)
+
+Pipeline 3 is the **strategic synthesis** stage. For a given player name it:
+
+1. Pulls **all their attributed events** (`player_id != -1`) across every match
+   they appear in from the `match_timelines` DynamoDB table (Pipeline 2's
+   output), sorted chronologically per match.
+2. Feeds the resulting event sentences to a local **Ollama** model
+   (`qwen2.5:7b` by default) with a prompt that explicitly states the data's
+   known gaps, asking for a 7-section strategic profile: playstyle, economy,
+   aggression, defense, teamwork, tendencies/strengths, and caveats.
+3. Stores the result as both `profile.json` (structured) and `profile.md`
+   (human-readable) in an S3-compatible bucket — **MinIO** locally, real AWS
+   S3 in prod, via the exact same boto3 code.
+
+Unlike Pipeline 2, there is **no deterministic fallback** here: synthesizing a
+strategic read genuinely requires an LLM. If Ollama or the configured model
+isn't available, the pipeline raises a clear `OllamaNotReadyError` / exits
+non-zero with an actionable message rather than fabricating a profile.
+
+## Layout
+
+```
+infra/docker-compose.yml          + minio service (aoe-minio, :9000 API / :9001 console)
+pipeline/config.py                + PROFILE_OLLAMA_* and S3_* settings
+pipeline/s3_store.py              boto3 S3/MinIO wrapper: ensure_bucket(), put_profile(), get_profile()
+pipeline/profile_synth.py         Ollama client + prompt + section parser: synthesize_profile()
+pipeline/pipeline3_profiles.py    orchestrator (python -m pipeline.pipeline3_profiles)
+```
+
+## How to run
+
+```bash
+# 1. start MinIO alongside chromadb + dynamodb-local (from the worktree root)
+docker compose -f infra/docker-compose.yml up -d
+
+# 2. pull the profiling model (one-time, ~4-5 GB download)
+ollama pull qwen2.5:7b
+
+# 3. (inside the activated .venv) list known attributed player names
+python -m pipeline.pipeline3_profiles --list
+
+# 4. build a profile for one player, or all of them
+python -m pipeline.pipeline3_profiles "Player 1"
+python -m pipeline.pipeline3_profiles --all
+```
+
+If the configured model isn't pulled yet (e.g. still downloading), the run
+prints a clear "not ready" message and exits 1 — check progress with
+`ollama list` and re-run once it appears.
+
+## Storage: MinIO now, real AWS S3 later — same code
+
+`pipeline/s3_store.py` builds its boto3 client from `pipeline/config.py`:
+
+- **Local dev (default):** `S3_ENDPOINT_URL=http://localhost:9000` with dummy
+  credentials (`localadmin` / `localpassword123`, matching the `minio` service's
+  `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` in `infra/docker-compose.yml`). Browse
+  stored profiles at the MinIO console, `http://localhost:9001`.
+- **Real AWS:** set `S3_ENDPOINT_URL=""` (empty) and provide real credentials via
+  the standard AWS mechanisms (env vars, `~/.aws/credentials`, or an IAM role).
+  With the endpoint unset, boto3 talks to the real regional S3 endpoint and
+  every other line of code is unchanged.
+
+Profiles are stored at stable (non-timestamped) keys, so re-running for a
+player simply overwrites their previous profile:
+
+```
+profiles/{player_name}/profile.json
+profiles/{player_name}/profile.md
+```
+
+## Known data gaps reflected in every profile
+
+The prompt sent to the model explicitly states, and every generated profile's
+**Caveats** section must restate, the same player-attribution limitation
+documented above for Pipeline 1/2: only BUILD, WALL, GATE, TRIBUTE, RESIGN,
+FLARE, and DELETE are player-attributed. **QUEUE/MULTIQUEUE (unit training) is
+not**, so profiles never claim anything about army composition, unit choices,
+or military unit counts — that data simply doesn't exist yet at the per-player
+level in this dataset.
