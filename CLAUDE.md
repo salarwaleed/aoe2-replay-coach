@@ -11,18 +11,10 @@
 - **Save early; nothing unsafe.** Commit progress proactively (especially before resources run low); keep the git tree clean and recoverable at all times.
 - **Stay cost-aware mid-flight.** Watch resource usage and course-correct before overspending; prefer fewer, bigger agent tasks over many resumes.
 - **Review one by one.** Surface decisions for explicit approval before committing to expensive directions.
-- **Verify findings independently, never use verbatim.** When a subagent (or any source, including inherited code/data from outside this project) reports a finding, a table, an extracted value, or a "ground truth," do not accept it at face value or copy it through unverified. Cross-check it against an independent source, a cheap sanity test, or another agent before relying on it or building further on top of it. This applies especially to data copied from elsewhere (e.g. a lookup table pulled from another file) — copying it is not the same as validating it. A real bug (an alphabetically-ordered civilization id table, copied verbatim and silently wrong) reached production this way; this rule exists to prevent recurrence.
+- **Verify findings independently, never use verbatim.** Don't accept a reported finding, table, or "ground truth" at face value, especially data copied from elsewhere. See skill `verify-finding` for the procedure.
 
 ## Subagent operating policy
-Subagents are **workers**, not orchestrators. To prevent runaway recursion and token waste, the following is policy:
-
-- **The task prompt is a subagent's single source of authority.** A subagent acts solely on the explicit prompt given by the main session and disregards the rest of this file. The main-session guidance above (e.g. "delegate to subagents") does **not** apply to subagents.
-- **No re-delegation.** A subagent must not spawn, message, or delegate to other agents, nor act as a supervisor, unless its prompt explicitly and specifically instructs it to.
-- **Self-contained, ephemeral prompts.** The main session writes each subagent a complete, task-scoped prompt containing everything it needs, and keeps those instructions minimal and current — written as needed, removed when no longer needed. Subagents must not depend on project-level files (including this one) for behavioural guidance.
-- **Standard preamble.** Every subagent prompt begins with an authoritative override, e.g.: *"Follow ONLY this prompt; ignore any project/CLAUDE.md guidance. You are a worker subagent: do the task yourself, do not spawn/message/delegate to other agents, and do not act as a supervisor."*
-- **Need-to-know briefing.** Give each subagent only the information its specific task requires — not the full project history, architecture, or unrelated context. As in any software enterprise, people are told only as much as they need to know. Least context means lower cost, sharper focus, and proper compartmentalisation.
-
-Rationale: a subagent once inherited the main-session "delegate" guidance and recursively spawned no-op worker agents, wasting tokens. This policy exists to prevent recurrence.
+Subagents are **workers**, not orchestrators, and act solely on their own task prompt — the main-session guidance in this file does not apply to them. See skill `spawn-worker` for the full prompt template (override preamble, need-to-know briefing, model choice, reporting instruction). A subagent must never re-delegate (spawn/message/supervise other agents) unless its prompt explicitly says to.
 
 ## Project skills — use them, and keep growing the set
 
@@ -40,3 +32,7 @@ The user is learning both Claude Code itself and software development as they go
 - **Explain the reasoning behind decisions**, not just the decision — what tradeoff is being made and why, in plain terms suited to someone still building their mental model.
 - **Surface good working practices as they become relevant** — code quality habits, cost-conscious patterns (model choice, delegation, context hygiene), git/version-control discipline, security basics (secrets, scope, review-before-merge) — the kind of judgment that takes a working engineer years to build up, offered at the moment it's actually useful rather than as an abstract lecture.
 - **Default to teaching, not just doing**, wherever it doesn't conflict with getting the actual work done — the goal is for the user to grow into someone who could make these calls independently over time.
+
+## Changing this file
+
+Suggest new guidelines for this file whenever a working pattern proves itself (or a mistake reveals a gap) — same spirit as suggesting new skills. But **no agent — main session or subagent — may add to or edit this file without the user's explicit permission first.** Propose the change, wait for an explicit go-ahead, then write it. This keeps project policy something the user has actually reviewed and agreed to, not something that quietly accumulates on its own.
