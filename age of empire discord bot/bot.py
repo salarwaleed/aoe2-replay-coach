@@ -1514,14 +1514,63 @@ async def random_civ(ctx: commands.Context, role: str = "any"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 ECO_SYSTEM_PROMPT = (
-    "You are an expert Age of Empires II economy and build-order coach. "
-    "You answer questions about villager allocation, resource splits, Town "
-    "Center booming, and eco recovery with concise, accurate, actionable "
-    "advice grounded in real AoE2 mechanics (gather rates, building/unit "
-    "costs, timings). Use short paragraphs or bullet points. Keep answers "
-    "tight enough to fit in a Discord embed — a few hundred words at most. "
-    "Do not pad with disclaimers."
+    "You are an expert Age of Empires II economy coach for a custom Voobly "
+    "v1.6 ruleset used on this server — NOT vanilla Age of Conquerors. In "
+    "this ruleset every player starts the match already in the IMPERIAL "
+    "AGE with large starting stockpiles (roughly 1000 food, 750 wood, and "
+    "300 stone observed in real scoreboards). There is no Dark Age "
+    "villager allocation, no Feudal Age click, and no age-up timing to "
+    "discuss — that vanilla advice does not apply here and you should not "
+    "give it. The dominant economic strategy is aggressive 'pocket "
+    "booming': immediately dropping a second and third Town Center to "
+    "flood villager production and snowball resource income before the "
+    "opponent can match your output. You don't have live search or "
+    "lookup tools — apply your own general AoE2 economic knowledge "
+    "(gather rates, building/unit costs, resource math) to reason about "
+    "THIS specific high-resource, multi-TC ruleset. Give concise, "
+    "actionable advice on villager allocation across multiple TCs, "
+    "resource splits, booming pace, and eco recovery. Use short "
+    "paragraphs or bullet points. Keep answers tight enough to fit in a "
+    "Discord embed — a few hundred words at most. Do not pad with "
+    "disclaimers."
 )
+
+
+def _build_profile_addendum(profile: dict | None) -> str:
+    """Build a short 'tailor your advice' addendum from a synthesized
+    strategic profile, for appending to the user-facing prompt (not the
+    system prompt). Returns "" if there's nothing usable."""
+    if not profile:
+        return ""
+    bits = []
+    for key, label in (
+        ("playstyle", "Playstyle"),
+        ("economy", "Economy"),
+        ("tendencies", "Tendencies"),
+    ):
+        text = (profile.get(key) or "").strip()
+        if text:
+            bits.append(f"{label}: {text}")
+    if not bits:
+        return ""
+    return (
+        "\n\nHere is this player's known tendencies, tailor your advice to "
+        "them:\n" + "\n".join(bits)
+    )
+
+
+def _lookup_profile_silently(target: str) -> dict | None:
+    """Fetch a synthesized strategic profile from MinIO the same way !coach
+    does. Returns None (silently) if no profile exists or storage is
+    unreachable — callers should fall back to generic advice."""
+    try:
+        from pipeline.s3_store import get_profile
+        profile, _ = get_profile(target)
+        return profile
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
 
 
 @bot.command(name="eco")
@@ -1536,14 +1585,18 @@ async def eco(ctx: commands.Context, *, query: str = None):
     """
     if query is None:
         prompt = (
-            "Give a general Age of Empires II economy overview: the standard "
-            "Dark Age villager distribution target for a 22-pop Feudal Age "
-            "click, and a quick reminder of base gather rates. Keep it tight."
+            "Give a general economy overview for this server's pocket-boom "
+            "ruleset: how to split villagers across multiple Town Centers "
+            "from the start of the match, the order to drop a 2nd and 3rd "
+            "TC, and a quick reminder of base gather rates. Keep it tight."
         )
         title = "🌾 Eco Reference — Overview"
     else:
         prompt = f"Age of Empires II economy question: {query}"
         title = f"🌾 Eco: {query}"
+
+    profile = _lookup_profile_silently(ctx.author.display_name)
+    prompt += _build_profile_addendum(profile)
 
     async with ctx.typing():
         answer = await asyncio.get_event_loop().run_in_executor(
@@ -1556,36 +1609,53 @@ async def eco(ctx: commands.Context, *, query: str = None):
 
 
 BUILD_SYSTEM_PROMPT = (
-    "You are an expert Age of Empires II build-order coach. You produce "
-    "accurate, concise step-by-step build orders for the requested opening "
-    "(or a general overview of popular openings if none is specified). "
-    "Include villager allocation, approximate timings, and a short note on "
-    "the attack angle, how it's countered, and best civs for it when "
-    "relevant. Keep the answer tight enough for a Discord embed — a few "
-    "hundred words at most. Use bullet points or numbered steps."
+    "You are an expert build-order coach for this server's custom Voobly "
+    "v1.6 ruleset — NOT vanilla Age of Conquerors. Every player starts "
+    "already in the IMPERIAL AGE with large starting stockpiles (roughly "
+    "1000 food, 750 wood, and 300 stone observed in real scoreboards). "
+    "There is no Dark Age, no Feudal Age click, and no age-progression "
+    "build order to give — early-tech and age-up advice is irrelevant "
+    "here and you should not produce it. Builds in this ruleset are about "
+    "what to do with the huge starting stockpile from second zero: how "
+    "many Town Centers to drop and in what order (the dominant pattern is "
+    "an aggressive multi-TC 'pocket boom' — 2nd and 3rd TC immediately to "
+    "flood villager and unit production), villager allocation across "
+    "those TCs, and the fastest path to overwhelming military production. "
+    "You don't have live search or lookup tools — apply your own general "
+    "AoE2 strategic knowledge to reason about THIS specific high-resource, "
+    "multi-TC ruleset. Include villager allocation, approximate timings, "
+    "and a short note on attack angle, how it's countered, and best civs "
+    "for it when relevant. Keep the answer tight enough for a Discord "
+    "embed — a few hundred words at most. Use bullet points or numbered "
+    "steps."
 )
 
 
 @bot.command(name="build")
 async def build_order(ctx: commands.Context, *, opening: str = None):
     """
-    !build               — AI overview of popular openings
-    !build scouts        — Full step-by-step scout rush build order
-    !build archers       — Archer rush build order
-    !build fast_castle   — Fast Castle / Knight boom
+    !build               — AI overview of this server's pocket-boom strategy
+    !build 3tc           — Full step-by-step 3-TC pocket boom build order
+    !build archers       — Archer-focused build order for this ruleset
+    !build turtle        — Defensive multi-TC build order
     (any build-order name or free-text request works)
     """
     if opening is None:
         prompt = (
-            "Give a brief overview of the most popular Age of Empires II "
-            "Feudal Age openings (e.g. Scout Rush, Archers, Men-at-Arms, "
-            "Fast Castle, Drush into Fast Castle): one or two lines each "
-            "covering the idea, attack angle, and what counters it."
+            "Give a brief overview of this server's pocket-boom ruleset "
+            "(players start in Imperial Age with ~1000 food/750 wood/300 "
+            "stone): the core idea of dropping a 2nd and 3rd Town Center "
+            "immediately, a couple of variations on how aggressively to "
+            "boom vs. transition to military, and what counters an "
+            "opponent who out-booms you. One or two lines per point."
         )
-        title = "🏗️ Build Orders — Strategy Overview"
+        title = "🏗️ Build Orders — Pocket Boom Overview"
     else:
-        prompt = f"Age of Empires II build order request: {opening}"
+        prompt = f"Build order request for this server's pocket-boom ruleset: {opening}"
         title = f"🏗️ Build Order: {opening}"
+
+    profile = _lookup_profile_silently(ctx.author.display_name)
+    prompt += _build_profile_addendum(profile)
 
     async with ctx.typing():
         answer = await asyncio.get_event_loop().run_in_executor(
@@ -1676,18 +1746,28 @@ async def _speak_step(voice_client: discord.VoiceClient, text: str, guild_id: in
 
 
 TRAINER_SYSTEM_PROMPT = (
-    "You are an Age of Empires II build-order trainer narrating steps out "
-    "loud over text-to-speech in a voice channel. Produce a numbered, "
-    "step-by-step training script for the requested build order. Output "
-    "ONE concise spoken instruction per line, numbered like 'Step 1. ...', "
-    "'Step 2. ...', and so on. Each line should be a short, complete "
-    "sentence suitable for being read aloud by TTS — no markdown, no "
-    "bullet symbols, no headers, just plain numbered sentences. Aim for "
-    "10-16 steps covering Dark Age villager allocation through the Feudal "
-    "Age click and into early production habits."
+    "You are a build-order trainer narrating steps out loud over "
+    "text-to-speech in a voice channel, for this server's custom Voobly "
+    "v1.6 ruleset — NOT vanilla Age of Conquerors. Every player starts "
+    "already in the IMPERIAL AGE with large starting stockpiles (roughly "
+    "1000 food, 750 wood, and 300 stone). There is no Dark Age villager "
+    "allocation and no Feudal Age click to narrate — do not include that "
+    "vanilla advice. Produce a numbered, step-by-step training script for "
+    "the requested build order, centered on this ruleset's dominant "
+    "pattern: aggressive multi-TC 'pocket booming' (dropping a 2nd and "
+    "3rd Town Center immediately from the starting stockpile) and the "
+    "early production habits that follow from it. You don't have live "
+    "search or lookup tools — apply your own general AoE2 knowledge to "
+    "this specific high-resource, multi-TC ruleset. Output ONE concise "
+    "spoken instruction per line, numbered like 'Step 1. ...', 'Step 2. "
+    "...', and so on. Each line should be a short, complete sentence "
+    "suitable for being read aloud by TTS — no markdown, no bullet "
+    "symbols, no headers, just plain numbered sentences. Aim for 10-16 "
+    "steps covering Town Center placement and villager allocation through "
+    "the transition into early production habits."
 )
 
-DEFAULT_TRAINER_BUILD = "standard scouts-into-castle-age economy opening"
+DEFAULT_TRAINER_BUILD = "standard pocket-boom opening with a 2nd and 3rd Town Center"
 
 
 def _parse_trainer_steps(raw: str) -> list[str]:
