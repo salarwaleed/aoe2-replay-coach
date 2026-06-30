@@ -2284,7 +2284,6 @@ from collections import defaultdict
 SAVEGAME_PATHS = [
     r"D:\Program Files (x86)\Microsoft Games\Age of Empires II\Voobly Mods\AOC\Data Mods\v1.6 Game Data\SaveGame",
 ]
-PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
 
 
 def _scan_recordings() -> list[str]:
@@ -2353,196 +2352,6 @@ def _parse_recording(filepath: str) -> dict:
         if "initial" in err.lower() or "lobby" in err.lower():
             return None
         return {"file": os.path.basename(filepath), "error": err}
-
-
-def _build_profiles(games: list[dict]) -> dict:
-    """Aggregate per-player stats across all parsed games."""
-    raw: dict[str, dict] = defaultdict(lambda: {
-        "games": 0, "wins": 0,
-        "civs": defaultdict(int),
-        "maps": defaultdict(int),
-        "durations": [],
-        "last_seen": "",
-    })
-
-    for g in games:
-        if "error" in g:
-            continue
-        for p in g.get("players", []):
-            name = p["name"]
-            r = raw[name]
-            r["games"] += 1
-            if p["winner"]:
-                r["wins"] += 1
-            r["civs"][p["civ"]] += 1
-            r["maps"][g["map"]] += 1
-            if g["duration_min"]:
-                r["durations"].append(g["duration_min"])
-            if g["date"] > r["last_seen"]:
-                r["last_seen"] = g["date"]
-
-    profiles: dict[str, dict] = {}
-    for name, r in raw.items():
-        win_rate = round(r["wins"] / r["games"] * 100) if r["games"] else 0
-        avg_len  = round(sum(r["durations"]) / len(r["durations"]), 1) if r["durations"] else None
-
-        civs_sorted = sorted(r["civs"].items(), key=lambda x: -x[1])
-        maps_sorted = sorted(r["maps"].items(), key=lambda x: -x[1])
-
-        # Simple weakness heuristics based on available stats
-        weaknesses = []
-        if win_rate < 40:
-            weaknesses.append("Win rate below 40% — review your Castle Age transition")
-        if avg_len and avg_len > 35:
-            weaknesses.append(f"Average game length {avg_len} min — games are going late, work on early pressure")
-        if avg_len and avg_len < 12:
-            weaknesses.append("Very short games — possibly early resigns, work on defensive play")
-        civ_count = len(civs_sorted)
-        if civ_count == 1:
-            weaknesses.append(f"Only playing {civs_sorted[0][0]} — opponent can prepare a hard counter every game")
-        if not weaknesses:
-            weaknesses.append("No obvious weaknesses detected from available data")
-
-        strengths = []
-        if win_rate >= 60:
-            strengths.append(f"Strong win rate ({win_rate}%)")
-        if civ_count >= 4:
-            strengths.append(f"Good civ variety ({civ_count} different civs played)")
-        if avg_len and 18 <= avg_len <= 30:
-            strengths.append(f"Efficient game pace ({avg_len} min avg) — strong mid-game")
-        if not strengths:
-            strengths.append("Keep playing — more data needed for strength analysis")
-
-        profiles[name] = {
-            "games":        r["games"],
-            "wins":         r["wins"],
-            "win_rate":     win_rate,
-            "avg_game_min": avg_len,
-            "favourite_civ":  civs_sorted[0][0] if civs_sorted else "Unknown",
-            "civ_breakdown":  {k: v for k, v in civs_sorted[:5]},
-            "favourite_map":  maps_sorted[0][0] if maps_sorted else "Unknown",
-            "map_breakdown":  {k: v for k, v in maps_sorted[:5]},
-            "last_seen":      r["last_seen"],
-            "strengths":      strengths,
-            "weaknesses":     weaknesses,
-        }
-    return profiles
-
-
-def _load_profiles() -> dict:
-    if os.path.exists(PROFILES_FILE):
-        with open(PROFILES_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    return {}
-
-
-def _save_profiles(profiles: dict):
-    with open(PROFILES_FILE, "w", encoding="utf-8") as fh:
-        json.dump(profiles, fh, indent=2, ensure_ascii=False)
-
-
-@bot.command(name="analyze")
-async def analyze(ctx: commands.Context):
-    """!analyze — Scan all recorded games and build player profiles."""
-    msg = await ctx.send("🔍 Scanning SaveGame folders for recordings…")
-
-    recordings = _scan_recordings()
-    if not recordings:
-        await msg.edit(content="❌ No `.mgz` files found in your SaveGame folders.")
-        return
-
-    await msg.edit(content=f"📂 Found **{len(recordings)}** recordings. Parsing… (this may take 30-60 seconds)")
-
-    games = []
-    errors = 0
-    skipped = 0
-    for rec in recordings:
-        parsed = await asyncio.get_event_loop().run_in_executor(None, _parse_recording, rec)
-        if parsed is None:
-            skipped += 1
-            continue
-        if "error" in parsed:
-            errors += 1
-        games.append(parsed)
-
-    profiles = _build_profiles(games)
-    _save_profiles(profiles)
-
-    valid = len(games) - errors
-    embed = discord.Embed(
-        title="✅ Analysis Complete",
-        description=(
-            f"Parsed **{valid}/{len(recordings)}** recordings successfully."
-            + (f" ({skipped} lobby/abandoned saves skipped)" if skipped else "")
-        ),
-        color=C_TEAMS,
-    )
-    embed.add_field(
-        name="Players found",
-        value="\n".join(
-            f"**{name}** — {p['games']} games, {p['win_rate']}% WR, fav civ: {p['favourite_civ']}"
-            for name, p in sorted(profiles.items(), key=lambda x: -x[1]["games"])
-        ) or "No players found",
-        inline=False,
-    )
-    if errors:
-        embed.add_field(name="⚠️ Parse errors", value=f"{errors} files failed (run `pip install mgz` if not installed)", inline=False)
-    embed.set_footer(text=f"Profiles saved to profiles.json | Use !profile <name> to view details")
-    await msg.edit(content=None, embed=embed)
-
-
-@bot.command(name="profile")
-async def profile_cmd(ctx: commands.Context, *, player_name: str = None):
-    """!profile [name] — Show a player's stats and strategic profile from recorded games."""
-    profiles = _load_profiles()
-
-    if not profiles:
-        await ctx.send("❌ No profiles found. Run `!analyze` first.")
-        return
-
-    if player_name is None:
-        names = ", ".join(f"`{n}`" for n in sorted(profiles.keys()))
-        await ctx.send(f"Usage: `!profile PlayerName`\nKnown players: {names}")
-        return
-
-    # Fuzzy match
-    key = next((k for k in profiles if k.lower() == player_name.lower()), None)
-    if key is None:
-        key = next((k for k in profiles if player_name.lower() in k.lower()), None)
-    if key is None:
-        await ctx.send(f"❌ Player `{player_name}` not found. Known: {', '.join(profiles.keys())}")
-        return
-
-    p = profiles[key]
-    wr_icon = "🟢" if p["win_rate"] >= 55 else ("🟡" if p["win_rate"] >= 40 else "🔴")
-
-    embed = discord.Embed(
-        title=f"🧠 Strategic Profile: {key}",
-        color=C_CIV,
-    )
-    embed.add_field(name="📊 Stats", value=(
-        f"{wr_icon} **Win Rate:** {p['win_rate']}% ({p['wins']}/{p['games']} games)\n"
-        f"⏱️ **Avg Game Length:** {p['avg_game_min']} min\n"
-        f"🏅 **Favourite Civ:** {p['favourite_civ']}\n"
-        f"🗺️ **Favourite Map:** {p['favourite_map']}\n"
-        f"📅 **Last Seen:** {p['last_seen']}"
-    ), inline=False)
-
-    civ_breakdown = " · ".join(f"{c} ×{n}" for c, n in p["civ_breakdown"].items())
-    embed.add_field(name="⚔️ Civs Played", value=civ_breakdown or "No data", inline=False)
-
-    embed.add_field(
-        name="✅ Strengths",
-        value="\n".join(f"• {s}" for s in p["strengths"]),
-        inline=False,
-    )
-    embed.add_field(
-        name="⚠️ Weaknesses",
-        value="\n".join(f"• {w}" for w in p["weaknesses"]),
-        inline=False,
-    )
-    embed.set_footer(text="Run !analyze to refresh profiles after new games.")
-    await ctx.send(embed=embed)
 
 
 @bot.command(name="mygames")
@@ -2649,15 +2458,23 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
         await ctx.send("❌ `gTTS` not installed. Run `pip install gTTS` and ensure FFmpeg is on PATH.")
         return
 
-    profiles = _load_profiles()
     target = player_name or ctx.author.display_name
 
-    # Find profile (fuzzy)
+    # Fetch the player's synthesized strategic profile from MinIO (written by
+    # pipeline 3) — the same source as !ask. Replaces the old local
+    # profiles.json system.
     profile = None
-    for k, v in profiles.items():
-        if target.lower() in k.lower():
-            profile = (k, v)
-            break
+    try:
+        from pipeline.s3_store import get_profile
+        profile, _ = get_profile(target)
+    except FileNotFoundError:
+        profile = None
+    except Exception as exc:  # storage unreachable — degrade to general coaching
+        await ctx.send(
+            f"⚠️ Couldn't reach the profile store (`{type(exc).__name__}`); "
+            "giving general coaching instead."
+        )
+        profile = None
 
     guild_id = ctx.guild.id
     if guild_id in trainer_sessions:
@@ -2669,33 +2486,38 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
     voice_client = await vc_channel.connect()
     trainer_sessions[guild_id] = {"vc": voice_client, "step": 0, "ctx": ctx}
 
-    # Build personalised script
+    # Build personalised script from the synthesized profile's behavioural
+    # sections (caveats omitted — it's a data-coverage note, not coaching).
     script = [COACH_INTRO]
 
     if profile:
-        name, p = profile
+        pname = profile.get("player_name", target)
+        n_matches = profile.get("n_matches", "several")
         script.append(
-            f"I have found a profile for {name} with {p['games']} recorded games "
-            f"and a {p['win_rate']} percent win rate."
+            f"I found a strategic profile for {pname}, "
+            f"synthesized from {n_matches} recorded matches."
         )
-        script.append(
-            f"Your favourite civilization is {p['favourite_civ']} "
-            f"and your favourite map is {p['favourite_map']}."
-        )
-        for w in p["weaknesses"]:
-            script.append(f"Area to improve: {w}")
-        for s in p["strengths"]:
-            script.append(f"Keep doing this: {s}")
+        for key, label in (
+            ("playstyle", "Your overall playstyle"),
+            ("economy", "On your economy"),
+            ("aggression", "On aggression"),
+            ("defense", "On defense"),
+            ("teamwork", "On teamwork"),
+            ("tendencies", "Your tendencies and strengths"),
+        ):
+            text = (profile.get(key) or "").strip()
+            if text:
+                script.append(f"{label}: {text}")
     else:
         script.append(
-            f"No profile found for {target}. Run exclamation mark analyze after your next games. "
-            f"For now, I will give you general coaching."
+            f"No profile found for {target} yet. Profiles are built "
+            f"automatically from your replays. For now, here is general coaching."
         )
 
     script += COACH_GENERIC_TIPS
     script.append(
         "That concludes your coaching session. "
-        "Type exclamation mark analyze after each game session to keep your profile updated. Good luck."
+        "Your profile updates automatically as you play more games. Good luck."
     )
 
     embed = discord.Embed(
@@ -2704,8 +2526,11 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
         color=C_ECO,
     )
     if profile:
-        _, p = profile
-        embed.add_field(name="Profile loaded", value=f"{p['games']} games · {p['win_rate']}% WR · {p['favourite_civ']}", inline=False)
+        embed.add_field(
+            name="Profile loaded",
+            value=f"{profile.get('n_matches', '?')} matches · model `{profile.get('model', '?')}`",
+            inline=False,
+        )
     await ctx.send(embed=embed)
 
     for i, line in enumerate(script):
@@ -2744,7 +2569,7 @@ async def on_ready():
     print(f"✅ {bot.user} is online and ready.")
     print(f"   Commands: !draft  !teams  !lobby  !reset  !civ  !has  !counter")
     print(f"             !eco  !build  !random  !hotkeys  !trainer")
-    print(f"             !analyze  !profile  !mygames  !coach  !ask")
+    print(f"             !mygames  !coach  !ask")
     start_savegame_watcher()
 
 
