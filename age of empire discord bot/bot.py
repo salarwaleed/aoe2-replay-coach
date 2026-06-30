@@ -19,6 +19,11 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# Daytime-capture watcher (TELEMETRY_PLAN.md §2 stage ①) — periodically
+# re-stages new SaveGame .mgz files into ChromaDB via Pipeline 1. Separate
+# system from the legacy !analyze/!profile/!mygames/!coach commands below.
+from savegame_watcher import start_savegame_watcher
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -2740,6 +2745,7 @@ async def on_ready():
     print(f"   Commands: !draft  !teams  !lobby  !reset  !civ  !has  !counter")
     print(f"             !eco  !build  !random  !hotkeys  !trainer")
     print(f"             !analyze  !profile  !mygames  !coach  !ask")
+    start_savegame_watcher()
 
 
 @bot.event
