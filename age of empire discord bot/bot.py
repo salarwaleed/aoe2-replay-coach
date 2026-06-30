@@ -2585,6 +2585,29 @@ async def mygames(ctx: commands.Context, *, player_name: str = None):
     await ctx.send(embed=embed)
 
 
+# ── ASK  (!ask <player_name>) ───────────────────────────────────────────────
+# Separate, new system: reads a player's *synthesized* strategic profile
+# (playstyle/economy/aggression/defense/teamwork/tendencies/caveats) from
+# MinIO via pipeline/s3_store.py — NOT the local profiles.json used by
+# !profile above. See ask_command.py for the implementation.
+# ─────────────────────────────────────────────────────────────────────────────
+from ask_command import fetch_and_build_embed as _ask_fetch_and_build_embed
+
+
+@bot.command(name="ask")
+async def ask_cmd(ctx: commands.Context, *, player_name: str = None):
+    """!ask <player_name> — Show a player's synthesized strategic profile (from MinIO)."""
+    if player_name is None:
+        await ctx.send("Usage: `!ask PlayerName`")
+        return
+
+    async with ctx.typing():
+        embed = await asyncio.get_event_loop().run_in_executor(
+            None, _ask_fetch_and_build_embed, player_name
+        )
+    await ctx.send(embed=embed)
+
+
 # ── VOICE COACH ───────────────────────────────────────────────────────────────
 # !coach [player_name]
 # Bot joins VC and narrates personalised coaching based on their recorded profile.
@@ -2716,7 +2739,7 @@ async def on_ready():
     print(f"✅ {bot.user} is online and ready.")
     print(f"   Commands: !draft  !teams  !lobby  !reset  !civ  !has  !counter")
     print(f"             !eco  !build  !random  !hotkeys  !trainer")
-    print(f"             !analyze  !profile  !mygames  !coach")
+    print(f"             !analyze  !profile  !mygames  !coach  !ask")
 
 
 @bot.event
