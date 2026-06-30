@@ -24,6 +24,10 @@ from dotenv import load_dotenv
 # system from the legacy !analyze/!profile/!mygames/!coach commands below.
 from savegame_watcher import start_savegame_watcher
 
+# Unified cloud-LLM backbone — every LLM-driven command routes through this
+# module rather than calling an HTTP API directly. See cloud_llm.py.
+import cloud_llm
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -991,209 +995,6 @@ COUNTERS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ECO GUIDE DATA  (gather rates accurate to AoE2 DE, apply 1:1 to 1.6)
-# ─────────────────────────────────────────────────────────────────────────────
-# Base gather rates (no upgrades, per second):
-#   Farming: 0.34 food/s | Foraging: 0.31 | Gold: 0.38 | Wood: 0.39 | Stone: 0.36
-# Production costs per unit:
-#   Villager: 50 food, 25s train
-#   Knight:   60f 75g  | Crossbow: 25w 45g | M@A: 60f 20g
-#   Stable:   needs ≥1 farmer & ≥1 gold miner per knight slot
-ECO_GUIDE = {
-    "1TC_constant": {
-        "label": "1 TC constant villager production",
-        "cost": "50 food / 25s",
-        "vills_needed": 5,
-        "note": "5 farmers (on farms) give ~1.7 food/s, which covers 1 vill every 25s.",
-    },
-    "2TC_constant": {
-        "label": "2 TC constant villager production",
-        "cost": "100 food / 25s",
-        "vills_needed": 10,
-        "note": "~10 farmers to sustain both TCs. Each extra TC needs 5 more farmers.",
-    },
-    "knights_1stable": {
-        "label": "1 Stable constant Knight production",
-        "cost": "60f + 75g / 30s",
-        "food_vills": 3,
-        "gold_vills": 4,
-        "note": "3 farmers (food) + 4 gold miners. Knights cost 60f/75g on 30s timer.",
-    },
-    "crossbow_1range": {
-        "label": "1 Range constant Crossbow production",
-        "cost": "25w + 45g / 27s",
-        "wood_vills": 2,
-        "gold_vills": 3,
-        "note": "2 lumberjacks + 3 gold miners. Crossbows cost 25w/45g on 27s timer.",
-    },
-    "knight_2stable": {
-        "label": "2 Stables constant Knight production",
-        "cost": "120f + 150g / 30s",
-        "food_vills": 6,
-        "gold_vills": 7,
-        "note": "6 farmers + 7 gold miners. Scale linearly: +3f +4g per additional stable.",
-    },
-    "dark_age_target": {
-        "label": "Dark Age distribution target (pre-Feudal, 22-pop)",
-        "split": "6 food (sheep/boar) → 4 wood → 6 food (farms) → 3 gold → 2 stone → 1 idle at TC",
-        "note": (
-            "Classic 22-pop Feudal:\n"
-            "  Vills 1-6  → sheep\n"
-            "  Vills 7-10 → wood\n"
-            "  Vill 11    → boar lure (keeps food flowing)\n"
-            "  Vills 12-17 → food (boar/sheep) + lure 2nd boar at ~14\n"
-            "  Vills 18-21 → farm (build under TC fire range)\n"
-            "  Vill 22    → gold (trigger Feudal)\n"
-            "  Research Loom immediately after queuing Feudal."
-        ),
-    },
-}
-
-ECO_TABLE = """
-```
-╔════════════════════════════════╦══════════╦══════════╦══════════════════════════╗
-║ Production Goal                ║ Food Vs  ║ Wood Vs  ║ Gold Vs                  ║
-╠════════════════════════════════╬══════════╬══════════╬══════════════════════════╣
-║ 1 TC constant vills            ║ 5 farms  ║ —        ║ —                        ║
-║ 2 TC constant vills            ║ 10 farms ║ —        ║ —                        ║
-║ 3 TC constant vills            ║ 15 farms ║ —        ║ —                        ║
-╠════════════════════════════════╬══════════╬══════════╬══════════════════════════╣
-║ 1 Stable constant Knights      ║ 3 farms  ║ —        ║ 4 miners                 ║
-║ 2 Stables constant Knights     ║ 6 farms  ║ —        ║ 7 miners                 ║
-║ 3 Stables constant Knights     ║ 9 farms  ║ —        ║ 11 miners                ║
-╠════════════════════════════════╬══════════╬══════════╬══════════════════════════╣
-║ 1 Range constant Crossbows     ║ —        ║ 2 woods  ║ 3 miners                 ║
-║ 2 Ranges constant Crossbows    ║ —        ║ 4 woods  ║ 6 miners                 ║
-╠════════════════════════════════╬══════════╬══════════╬══════════════════════════╣
-║ 1 TC + 1 Stable (Knight boom)  ║ 8 farms  ║ —        ║ 4 miners                 ║
-║ 1 TC + 2 Stables               ║ 11 farms ║ —        ║ 7 miners                 ║
-╚════════════════════════════════╩══════════╩══════════╩══════════════════════════╝
-Base gather rates (no upgrades): Farm 0.34/s  |  Wood 0.39/s  |  Gold 0.38/s
-```
-"""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BUILD ORDERS  (for !build command)
-# ─────────────────────────────────────────────────────────────────────────────
-BUILD_ORDERS = {
-    "scouts": {
-        "name": "Scout Rush (22-pop Feudal)",
-        "color": 0x2ECC71,
-        "steps": [
-            "**Vills 1-6** → Sheep (build 2 houses while walking)",
-            "**Vills 7-10** → Wood (build Lumber Camp)",
-            "**Vill 11** → Boar lure (eat under TC fire)",
-            "**Vills 12-17** → Mix sheep/boar food, lure 2nd boar at vill 14",
-            "**Vills 18-21** → Build 4 Farms under TC",
-            "**Vill 22** → Gold mine (build house + Mining Camp)",
-            "**Click Feudal** at 22 pop — research Loom beforehand",
-            "**In Feudal** → build Stable + Blacksmith with 2 forwarded vills",
-            "**Research** Forging + Double-Bit Axe",
-            "**Train scouts** as soon as Stable finishes",
-            "**Raid enemy sheep** and wood line, deny scouting",
-        ],
-        "timing": "Feudal: ~9:30-10:00 | Scouts out: ~11:00",
-    },
-    "archers": {
-        "name": "Archer Rush (22-pop Feudal)",
-        "color": 0x3498DB,
-        "steps": [
-            "**Vills 1-6** → Sheep",
-            "**Vills 7-10** → Wood (Lumber Camp)",
-            "**Vill 11** → Boar lure",
-            "**Vills 12-16** → Sheep/boar food",
-            "**Vills 17-19** → Wood (second Lumber Camp or same)",
-            "**Vills 20-21** → Farms",
-            "**Vill 22** → Gold mine",
-            "**Click Feudal** at 22 pop",
-            "**In Feudal** → build 2 Archery Ranges with forwarded vills",
-            "**Research** Fletching + Double-Bit Axe",
-            "**Train 2 archers/range** continuously",
-            "**Attack at ~18-20 archers**, focus villagers and TCs",
-        ],
-        "timing": "Feudal: ~9:30 | First archers: ~11:30 | Attack: ~14:00",
-    },
-    "maa": {
-        "name": "Men-at-Arms into Archers",
-        "color": 0xE67E22,
-        "steps": [
-            "**Vills 1-6** → Sheep",
-            "**Vills 7-10** → Wood",
-            "**Vill 11** → Boar lure",
-            "**Vills 12-14** → Gold (Mining Camp early — key for M@A)",
-            "**Vills 15-18** → Sheep/boar food",
-            "**Vills 19-21** → Farms",
-            "**Vill 22** → Wood",
-            "**Click Feudal at 22 pop** — research Loom in Dark Age",
-            "**Queue M@A upgrade immediately** on Feudal (research in Barracks, 100f/40g)",
-            "**Send 4-5 M@A** to enemy early — they beat villagers, ignore archers badly",
-            "**Meanwhile** build 1-2 Archery Ranges",
-            "**Transition to Crossbows** in Castle Age",
-        ],
-        "timing": "Feudal: ~10:00 | M@A arrive: ~12:30 | Transition Castle: ~17:00",
-    },
-    "fast_castle": {
-        "name": "Fast Castle (23-pop)",
-        "color": 0x9B59B6,
-        "steps": [
-            "**Vills 1-6** → Sheep",
-            "**Vills 7-10** → Wood",
-            "**Vill 11** → Boar lure",
-            "**Vills 12-17** → Sheep/boar/farms",
-            "**Vills 18-21** → Gold (mining camp at gold)",
-            "**Vill 22-23** → More food or wood",
-            "**Click Feudal at 23 pop**",
-            "**In Feudal** → build Market + Blacksmith ASAP with 2 forwarded vills",
-            "**Click Castle Age** immediately (no military in Feudal)",
-            "**Build Castle** on arrival — protect with walls",
-            "**Train Knights** or unique units immediately",
-            "**Research Bloodlines + Forging** in Castle Age",
-        ],
-        "timing": "Feudal: ~10:30 | Castle Age: ~15:30 | Knights out: ~17:00",
-    },
-    "drush_fc": {
-        "name": "Dark Age Rush → Fast Castle (Drush FC)",
-        "color": 0xE74C3C,
-        "steps": [
-            "**Vills 1-6** → Sheep",
-            "**Vills 7-9** → Wood",
-            "**Vill 10** → Boar lure",
-            "**Vills 11-12** → Build 2 Barracks (Drush requires Barracks in Dark Age)",
-            "**Train 3 Militia** (60f/20g each) — send straight to enemy",
-            "**Militia harass** villagers, slow down enemy eco",
-            "**Vills 13-17** → Gold rush",
-            "**Vills 18-21** → Farms",
-            "**Click Feudal at 21-22 pop**",
-            "**In Feudal** build only Market + Blacksmith → skip to Castle immediately",
-            "**Castle Age** with knights as your payoff",
-        ],
-        "timing": "Feudal: ~10:30 | Castle: ~16:00",
-    },
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TRAINER VOICE STEPS  (for !trainer command — spoken aloud in VC via gTTS)
-# ─────────────────────────────────────────────────────────────────────────────
-TRAINER_STEPS = [
-    "Step 1. Game start. Your first 3 villagers go to sheep immediately. No exceptions.",
-    "Step 2. Queue your 4th, 5th, and 6th villagers while walking. Watch for your first house — build it now.",
-    "Step 3. Villagers 7 through 10 go to the nearest wood line. Build a Lumber Camp.",
-    "Step 4. Villager 11 lures the first boar. Walk him to the boar, click attack, then immediately run back under your Town Center fire.",
-    "Step 5. Villagers 12 through 17 go to food — sheep, boar, or forage bush depending on what is available.",
-    "Step 6. Lure your second boar at villager 14. Same rule — attack it and run back to the Town Center.",
-    "Step 7. Villagers 18 through 21 build farms directly under your Town Center. Four farms minimum.",
-    "Step 8. Villager 22 goes to gold. Build a Mining Camp. This triggers your Feudal Age click.",
-    "Step 9. Click Feudal Age now. Research Loom first if you haven't already. You should be at 22 population.",
-    "Step 10. While aging up, send 2 villagers forward near the enemy base to prepare your military buildings.",
-    "Step 11. When Feudal hits, build your military buildings immediately with the forwarded villagers.",
-    "Step 12. In Castle Age, your goal is 3 Town Centers with constant villager production. That needs 15 farmers plus your gold miners.",
-    "Step 13. Never let your Town Center go idle. The moment you have enough food, queue a villager. This is the most important habit.",
-    "Step 14. Use your Select All Town Centers hotkey — press it every 10 to 15 seconds. Queue a villager. Make this muscle memory.",
-    "Step 15. Go to idle villager frequently. Every idle second is lost economy. No idle villagers after minute 5.",
-    "Congratulations. You have completed the economy trainer. Repeat this daily until it is automatic.",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DRAFT SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
 # Format:
@@ -1712,368 +1513,87 @@ async def random_civ(ctx: commands.Context, role: str = "any"):
 # ECO & TRAINING COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
+ECO_SYSTEM_PROMPT = (
+    "You are an expert Age of Empires II economy and build-order coach. "
+    "You answer questions about villager allocation, resource splits, Town "
+    "Center booming, and eco recovery with concise, accurate, actionable "
+    "advice grounded in real AoE2 mechanics (gather rates, building/unit "
+    "costs, timings). Use short paragraphs or bullet points. Keep answers "
+    "tight enough to fit in a Discord embed — a few hundred words at most. "
+    "Do not pad with disclaimers."
+)
+
+
 @bot.command(name="eco")
 async def eco(ctx: commands.Context, *, query: str = None):
     """
-    !eco               — Full reference table
-    !eco 3tc           — Exact vill split for 3 TCs + constant knight/archer production
-    !eco 4tc           — 4 TC boom split
-    !eco knights       — How many vills for 1-3 stables of knights
-    !eco archers       — How many vills for 1-2 ranges of crossbows
-    !eco boom          — Aggressive boom: fastest path to 3-4 TCs
-    !eco rush          — Eco floor for all-in aggression
+    !eco               — General eco overview (AI-generated)
+    !eco 3tc           — Vill split for 3 TCs + constant production
+    !eco knights       — How many vills to support knight production
+    !eco boom          — Aggressive boom strategy
     !eco short food    — Fix a food shortage right now
-    !eco short wood    — Fix a wood shortage right now
-    !eco short gold    — Fix a gold shortage right now
+    (any free-text economy/build question works)
     """
     if query is None:
-        embed = discord.Embed(
-            title="🌾 Eco Reference — 1.6 Villager Allocation",
-            description=ECO_TABLE,
-            color=C_ECO,
+        prompt = (
+            "Give a general Age of Empires II economy overview: the standard "
+            "Dark Age villager distribution target for a 22-pop Feudal Age "
+            "click, and a quick reminder of base gather rates. Keep it tight."
         )
-        embed.add_field(
-            name="💡 Dark Age Target (22-pop Feudal)",
-            value=(
-                "Vills 1-6 → Sheep\n"
-                "Vills 7-10 → Wood\n"
-                "Vill 11 → Boar lure (eat under TC)\n"
-                "Vills 12-17 → Food (sheep/boar)\n"
-                "Vills 18-21 → Farms\n"
-                "Vill 22 → Gold (click Feudal)"
-            ),
-            inline=False,
+        title = "🌾 Eco Reference — Overview"
+    else:
+        prompt = f"Age of Empires II economy question: {query}"
+        title = f"🌾 Eco: {query}"
+
+    async with ctx.typing():
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: cloud_llm.safe_ask(prompt, system=ECO_SYSTEM_PROMPT),
         )
-        embed.add_field(
-            name="🔍 In-game shortcuts",
-            value=(
-                "`!eco 3tc` · `!eco 4tc` · `!eco knights` · `!eco archers`\n"
-                "`!eco boom` · `!eco rush` · `!eco short food/wood/gold`"
-            ),
-            inline=False,
-        )
-        embed.set_footer(text="Gather rates: Farm 0.34/s | Wood 0.39/s | Gold 0.38/s | Stone 0.36/s")
-        await ctx.send(embed=embed)
-        return
 
-    q = query.lower().strip()
-
-    # ── SHORT [resource] ──────────────────────────────────────────────────────
-    if q.startswith("short"):
-        resource = q.replace("short", "").strip()
-        fixes = {
-            "food": (
-                "🌾 **Running low on food?**",
-                [
-                    "**Immediate:** Pull 2-3 gold miners → drop them on your nearest farm cluster.",
-                    "**Check:** Are all farms adjacent to a Mill? Non-adjacent farms waste walk time.",
-                    "**Rule of thumb:** Each TC needs 5 farmers to produce constantly. If you have 3 TCs, you need 15 farms staffed.",
-                    "**Late game:** Research Heavy Plow + Crop Rotation to raise farm yield without extra vills.",
-                    "**Emergency:** Drop a Market and sell 200 wood → 150ish food. Costs eco but saves a timing.",
-                ],
-                "Farm 0.34 food/s per villager (no upgrades). Wheelbarrow adds ~10%.",
-            ),
-            "wood": (
-                "🪵 **Running low on wood?**",
-                [
-                    "**Immediate:** Shift 3-4 food/gold vills → nearest Lumber Camp. Chop the closest trees first.",
-                    "**Check:** Have you researched Double-Bit Axe and Bow Saw? Those are +15% and +20% respectively — huge.",
-                    "**Farms eat wood:** Each farm costs 60w. If you're booming farms, you need a big wood bank first.",
-                    "**Wood floor:** Keep at least 2 dedicated lumberjacks per farm you intend to build.",
-                    "**Emergency:** Sell 200 stone at Market for ~100 wood if you have stone surplus.",
-                ],
-                "Wood 0.39/s per villager (no upgrades). Double-Bit Axe → +15%, Bow Saw → +20%.",
-            ),
-            "gold": (
-                "💰 **Running low on gold?**",
-                [
-                    "**Immediate:** Shift 2-3 food or wood vills → gold mine. Prioritise closer mines.",
-                    "**Check:** Did you research Gold Mining and Gold Shaft Mining? That's +15% and +30% total.",
-                    "**Relics:** 1 relic = ~0.5 gold/s. Grabbing 3 relics = ~1.5 gold/s — equivalent to ~4 miners.",
-                    "**Trade:** Set up a Market + Trade Cart route if you're in late Castle/Imperial — safe passive income.",
-                    "**Emergency:** Sell excess food or wood at the Market for gold.",
-                    "**Turk tip:** Turkish players get Gold Shaft Mining free — switch to them if this is a recurring problem.",
-                ],
-                "Gold 0.38/s per villager. Gold Shaft Mining (Imperial): +30% total over base.",
-            ),
-            "stone": (
-                "🪨 **Running low on stone?**",
-                [
-                    "**Shift vills:** Move 2-3 vills to stone. Research Stone Mining + Stone Shaft Mining ASAP.",
-                    "**Prioritise:** Stone goes to Castles (650 stone each) and Town Centers (275 stone). Plan ahead.",
-                    "**Market:** Sell food or wood for stone if you're mid-siege and need a Castle now.",
-                    "**Korean bonus:** Koreans mine stone 20% faster — great civ if you plan to wall/castle heavily.",
-                ],
-                "Stone 0.36/s per villager. Stone Shaft Mining adds +15%.",
-            ),
-        }
-        if resource not in fixes:
-            await ctx.send(f"❌ Unknown resource `{resource}`. Try: `!eco short food`, `!eco short wood`, `!eco short gold`, `!eco short stone`.")
-            return
-        title, steps, footer = fixes[resource]
-        embed = discord.Embed(title=f"🚨 Eco Fix: {title}", color=C_COUNTER)
-        embed.add_field(name="What to do RIGHT NOW", value="\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)), inline=False)
-        embed.set_footer(text=footer)
-        await ctx.send(embed=embed)
-        return
-
-    # ── TC COUNT SPLITS ───────────────────────────────────────────────────────
-    tc_splits = {
-        "2tc": {
-            "title": "2 TC Boom Split",
-            "description": "Standard Castle Age eco — sustain 2 TCs + 1 stable knights.",
-            "split": [
-                "🌾 **~18 Farmers** (farms under both TCs — aim for Mill adjacency)",
-                "🪵 **8-10 Lumberjacks** (sustain farm builds + houses)",
-                "💰 **6-8 Gold Miners** (1 stable knights needs 4 miners)",
-                "🪨 **0-2 Stone** (only if building a Castle or 3rd TC)",
-            ],
-            "notes": "Drop 2nd TC at ~16:00. Immediately staff it with 4-5 farmers. Knights out of 1 stable.",
-            "vills_total": "~35-40 villagers",
-        },
-        "3tc": {
-            "title": "3 TC Aggressive Boom",
-            "description": "The sweet spot for dominating the mid-game. Forces a timing window before enemy can mass an army.",
-            "split": [
-                "🌾 **22-25 Farmers** (5 per TC minimum = 15, extras absorb boom)",
-                "🪵 **10-12 Lumberjacks** (wood for farms + buildings)",
-                "💰 **10-12 Gold Miners** (2 stables = 7 miners; 3 stables = 11 miners)",
-                "🪨 **2-3 Stone** (for 3rd TC at 275 stone or a Castle at 650)",
-            ],
-            "notes": (
-                "Build 3rd TC at ~20:00 as you hit ~45 pop. "
-                "Pair with 2 stables — you'll have Knights and constant vills. "
-                "Attack window: ~24:00 with 10+ knights."
-            ),
-            "vills_total": "~50-55 villagers",
-        },
-        "4tc": {
-            "title": "4 TC Full Boom",
-            "description": "Maximum eco pressure. Win by out-producing everything.",
-            "split": [
-                "🌾 **28-32 Farmers** (20 base + extras on boom)",
-                "🪵 **12-15 Lumberjacks** (heavy farm build queue)",
-                "💰 **12-15 Gold Miners** (3 stables + upgrades)",
-                "🪨 **0-2 Stone** (only for extra TC/Castle — sell rest at Market)",
-            ],
-            "notes": (
-                "4th TC at ~24-26:00. You need ~900 stone total (275×3 extra TCs + Castle). "
-                "By 30 min you should have 70+ vills and 3 stables pumping Knights. "
-                "Wall up while booming — you are vulnerable until ~22 min."
-            ),
-            "vills_total": "~65-75 villagers at peak",
-        },
-    }
-    if q in tc_splits:
-        d = tc_splits[q]
-        embed = discord.Embed(title=f"🏘️ {d['title']}", description=d["description"], color=C_ECO)
-        embed.add_field(name="Villager Split", value="\n".join(d["split"]), inline=False)
-        embed.add_field(name="📌 Notes", value=d["notes"], inline=False)
-        embed.set_footer(text=f"Total vills: {d['vills_total']} | Farm 0.34/s | Wood 0.39/s | Gold 0.38/s")
-        await ctx.send(embed=embed)
-        return
-
-    # ── PRODUCTION GOALS ─────────────────────────────────────────────────────
-    if q in ("knights", "knight"):
-        embed = discord.Embed(title="🐴 Knight Production Eco", color=C_ECO)
-        embed.add_field(name="Per Stable (constant Knights, 30s each)", value=(
-            "🌾 **3 farmers** for food (60f/30s = 2.0 food/s needed, 3 farms = 1.02/s → use surplus from TC food)\n"
-            "💰 **4 gold miners** for gold (75g/30s = 2.5 gold/s needed, 4 miners = 1.52/s — supplement with 1 extra if short)\n"
-            "**Practical:** 3 farms + 5 gold miners per stable is safer with no eco upgrades."
-        ), inline=False)
-        embed.add_field(name="Scale-up", value=(
-            "1 Stable → 3 farms + 5 gold\n"
-            "2 Stables → 6 farms + 9 gold\n"
-            "3 Stables → 10 farms + 13 gold\n"
-            "*(Plus 5 farms per TC for vill production)*"
-        ), inline=False)
-        embed.add_field(name="⚡ Aggressive tip", value=(
-            "Going 3 stables at Castle Age entry? You need ~25 farmers + 13 gold miners just for knights + 2 TCs. "
-            "Pre-build your gold mines and farms in Feudal so the switch is instant."
-        ), inline=False)
-        embed.set_footer(text="Bloodlines + Forging first. Then Castle → stables. Never idle your stables.")
-        await ctx.send(embed=embed)
-        return
-
-    if q in ("archers", "archer", "crossbow", "crossbows"):
-        embed = discord.Embed(title="🏹 Archer/Crossbow Production Eco", color=C_ECO)
-        embed.add_field(name="Per Range (constant Crossbows, 27s each)", value=(
-            "🪵 **2 lumberjacks** for wood (25w/27s ≈ 0.93 wood/s, 2 cutters = 0.78/s — top up with 1 extra early)\n"
-            "💰 **3 gold miners** for gold (45g/27s ≈ 1.67 gold/s, 3 miners = 1.14/s — use 4 if no Gold Mining)\n"
-            "**Practical:** 3 wood + 4 gold per range until Bow Saw is researched."
-        ), inline=False)
-        embed.add_field(name="Scale-up", value=(
-            "1 Range → 3 wood + 4 gold\n"
-            "2 Ranges → 5 wood + 7 gold\n"
-            "3 Ranges → 8 wood + 11 gold\n"
-            "*(Plus 5 farms per TC for vill production)*"
-        ), inline=False)
-        embed.add_field(name="⚡ Aggressive tip", value=(
-            "2 ranges in Feudal is standard archer rush. "
-            "Your wood line is your lifeline — never let it drop below 4 cutters while archers are pumping."
-        ), inline=False)
-        embed.set_footer(text="Fletching → Bodkin Arrow → Bracer. Research in that order. Never skip.")
-        await ctx.send(embed=embed)
-        return
-
-    if q == "boom":
-        embed = discord.Embed(
-            title="💥 Aggressive Boom — Fastest Path to Dominance",
-            description="This is the fastest way to get to 3 TCs + 3 stables without dying.",
-            color=C_ECO,
-        )
-        embed.add_field(name="Timeline", value=(
-            "🌑 **Dark Age** → 22-pop Feudal (9:30-10:00)\n"
-            "⚔️ **Feudal** → Build Market + Blacksmith only. Skip military. Click Castle immediately.\n"
-            "🏰 **Castle entry (~15:30)** → Drop 2nd TC + 1 Castle + 1 Stable simultaneously.\n"
-            "⚡ **16-18 min** → Drop 2nd Stable as vill count hits 40.\n"
-            "💪 **20-22 min** → Drop 3rd TC + 3rd Stable. You now have the strongest eco on the map."
-        ), inline=False)
-        embed.add_field(name="Vill distribution at 3 TCs", value=(
-            "🌾 22+ Farmers | 🪵 10 Lumberjacks | 💰 11 Gold Miners | 🪨 2-3 Stone\n"
-            "*(Adjust: if attacked, pull 5 gold miners → army support. Never stop TC production.)*"
-        ), inline=False)
-        embed.add_field(name="⚠️ Wall while you boom", value=(
-            "You are **wide open** from min 12 to min 20. "
-            "Use 2 villagers to lay stone walls around your base at ~11:30. "
-            "This buys you 3-4 minutes against scouts/archers."
-        ), inline=False)
-        embed.set_footer(text="3 TCs + 3 stables at 20 min = game over for most opponents.")
-        await ctx.send(embed=embed)
-        return
-
-    if q == "rush":
-        embed = discord.Embed(
-            title="⚔️ Eco Floor for All-In Aggression",
-            description="Minimum eco to keep your army alive while pressuring hard.",
-            color=C_COUNTER,
-        )
-        embed.add_field(name="Minimum eco while rushing", value=(
-            "🌾 **10-12 Farmers** (enough for 1 TC + food drain of army)\n"
-            "🪵 **6 Lumberjacks** (farms + buildings)\n"
-            "💰 **5-6 Gold Miners** (keep military funded)\n"
-            "⚠️ Do NOT go below this or your army dies mid-fight with no follow-up."
-        ), inline=False)
-        embed.add_field(name="What to do if your rush fails", value=(
-            "1. Do NOT panic-idle your TC.\n"
-            "2. Pull 2 gold miners → farms immediately.\n"
-            "3. Add 2 more lumberjacks → prepare a 2nd TC.\n"
-            "4. Use the pressure you created to buy time for a boom.\n"
-            "5. Type `!eco 3tc` for the boom target to aim for."
-        ), inline=False)
-        embed.set_footer(text="Rushing is a timing attack, not a strategy. Always have an eco backup plan.")
-        await ctx.send(embed=embed)
-        return
-
-    # ── FALLTHROUGH ───────────────────────────────────────────────────────────
-    opts = "`!eco` · `!eco 2tc` · `!eco 3tc` · `!eco 4tc` · `!eco knights` · `!eco archers` · `!eco boom` · `!eco rush` · `!eco short food/wood/gold/stone`"
-    await ctx.send(f"❌ Unknown eco query `{query}`.\nTry: {opts}")
+    embed = discord.Embed(title=title, description=answer, color=C_ECO)
+    await ctx.send(embed=embed)
 
 
-BUILD_META = {
-    "scouts": {
-        "category": "🗡️ Aggressive",
-        "tagline": "Fast pressure in Feudal. Scout harass denies enemy sheep, slows eco.",
-        "attack":  "Hit enemy sheep line and wood line at ~11:00. Kill vills, not scouts.",
-        "counter": "Enemy Spearman shuts down scouts. Transition to Archers if countered.",
-        "defense": "Wall your base. Spearman + TC fire holds scout rush easily.",
-        "best_civs": "Mongols, Franks, Magyars, Georgians",
-    },
-    "archers": {
-        "category": "🗡️ Aggressive",
-        "tagline": "Most common competitive opening. 2 ranges in Feudal, then 3+ in Castle.",
-        "attack":  "Focus enemy villagers. Stay at max range. Micro back when Skirms appear.",
-        "counter": "Skirmishers hard-counter archers. Mix in Swordsmen to zone Skirms.",
-        "defense": "Skirms + Spears + TC fire beats archer rush. Walling limits angles.",
-        "best_civs": "Britons, Mayans, Ethiopians, Vietnamese, Mongols",
-    },
-    "maa": {
-        "category": "🗡️ Aggressive",
-        "tagline": "Feudal Men-at-Arms pressure, then transition to Crossbows in Castle.",
-        "attack":  "M@A kill vills and force bad fights. Follow up with Crossbows in Castle Age.",
-        "counter": "Enemy Spearman + TC fire. If they have Spears + Skirms you must pull back.",
-        "defense": "Spearman behind TC fire + walls. M@A can't breach walls without siege.",
-        "best_civs": "Japanese, Goths, Vikings, Teutons, Bulgarians",
-    },
-    "fast_castle": {
-        "category": "🏰 Boom",
-        "tagline": "Skip Feudal military, Castle Age by ~15:30. Knights or unique unit payoff.",
-        "attack":  "Castle entry timing: immediately drop Knights at ~17:00. Hit before walls are up.",
-        "counter": "Enemy fast Feudal pressure (archers/scouts) can punish the boom window.",
-        "defense": "Wall in Feudal. TC + 2-4 Spearman holds most rushes long enough.",
-        "best_civs": "Franks, Persians, Lithuanians, Huns, Slavs",
-    },
-    "drush_fc": {
-        "category": "🗡️ Aggressive Boom",
-        "tagline": "Dark Age Militia rush slows enemy, then skip straight to Castle Age. Best of both.",
-        "attack":  "3 Militia harass at ~8:00. Don't over-commit — pull back and boom.",
-        "counter": "Enemy wall early and Militia die to TC fire. Risky if scouted.",
-        "defense": "Walls in Dark Age completely neutralise Militia. Hard counter.",
-        "best_civs": "Aztecs, Mayans, Slavs, Celts, Vikings",
-    },
-}
+BUILD_SYSTEM_PROMPT = (
+    "You are an expert Age of Empires II build-order coach. You produce "
+    "accurate, concise step-by-step build orders for the requested opening "
+    "(or a general overview of popular openings if none is specified). "
+    "Include villager allocation, approximate timings, and a short note on "
+    "the attack angle, how it's countered, and best civs for it when "
+    "relevant. Keep the answer tight enough for a Discord embed — a few "
+    "hundred words at most. Use bullet points or numbered steps."
+)
+
 
 @bot.command(name="build")
 async def build_order(ctx: commands.Context, *, opening: str = None):
     """
-    !build               — Show all openings overview with attack/counter/defense angles
+    !build               — AI overview of popular openings
     !build scouts        — Full step-by-step scout rush build order
     !build archers       — Archer rush build order
-    !build maa           — Men-at-Arms → Crossbow build order
     !build fast_castle   — Fast Castle / Knight boom
-    !build drush_fc      — Dark Rus Militia → Fast Castle
+    (any build-order name or free-text request works)
     """
     if opening is None:
-        embed = discord.Embed(
-            title="🏗️ Build Orders — Strategy Overview",
-            description="Pick an opening based on your civ and the situation. Click a name for full steps.",
-            color=C_BUILD,
+        prompt = (
+            "Give a brief overview of the most popular Age of Empires II "
+            "Feudal Age openings (e.g. Scout Rush, Archers, Men-at-Arms, "
+            "Fast Castle, Drush into Fast Castle): one or two lines each "
+            "covering the idea, attack angle, and what counters it."
         )
-        for key, meta in BUILD_META.items():
-            bo = BUILD_ORDERS[key]
-            embed.add_field(
-                name=f"{meta['category']}  ·  `!build {key}`  ·  {bo['name']}",
-                value=(
-                    f"📌 {meta['tagline']}\n"
-                    f"⚔️ **Attack:** {meta['attack']}\n"
-                    f"🛡️ **Counter:** {meta['counter']}\n"
-                    f"🏰 **Defense vs this:** {meta['defense']}\n"
-                    f"🏅 **Best civs:** {meta['best_civs']}\n"
-                    f"⏱️ {bo['timing']}"
-                ),
-                inline=False,
-            )
-        embed.set_footer(text="Type !build <name> for the full step-by-step build order.")
-        await ctx.send(embed=embed)
-        return
+        title = "🏗️ Build Orders — Strategy Overview"
+    else:
+        prompt = f"Age of Empires II build order request: {opening}"
+        title = f"🏗️ Build Order: {opening}"
 
-    key  = opening.lower().replace(" ", "_").replace("-", "_")
-    data = BUILD_ORDERS.get(key)
-
-    if data is None:
-        close = [k for k in BUILD_ORDERS if opening.lower() in k]
-        if not close:
-            await ctx.send(f"❌ Build order `{opening}` not found. Type `!build` to see all options.")
-            return
-        key  = close[0]
-        data = BUILD_ORDERS[key]
-
-    meta  = BUILD_META.get(key, {})
-    embed = discord.Embed(title=f"🏗️ {data['name']}", color=data["color"])
-
-    if meta:
-        embed.description = (
-            f"⚔️ **Attack angle:** {meta['attack']}\n"
-            f"🛡️ **How to counter this:** {meta['counter']}\n"
-            f"🏰 **Defense vs this:** {meta['defense']}"
+    async with ctx.typing():
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: cloud_llm.safe_ask(prompt, system=BUILD_SYSTEM_PROMPT),
         )
 
-    embed.add_field(name="Build Steps", value="\n".join(data["steps"]), inline=False)
-
-    if meta.get("best_civs"):
-        embed.add_field(name="🏅 Best civs for this", value=meta["best_civs"], inline=False)
-
-    embed.set_footer(text=f"⏱️ {data['timing']}")
+    embed = discord.Embed(title=title, description=answer, color=C_BUILD)
     await ctx.send(embed=embed)
 
 
@@ -2155,9 +1675,47 @@ async def _speak_step(voice_client: discord.VoiceClient, text: str, guild_id: in
     return True
 
 
+TRAINER_SYSTEM_PROMPT = (
+    "You are an Age of Empires II build-order trainer narrating steps out "
+    "loud over text-to-speech in a voice channel. Produce a numbered, "
+    "step-by-step training script for the requested build order. Output "
+    "ONE concise spoken instruction per line, numbered like 'Step 1. ...', "
+    "'Step 2. ...', and so on. Each line should be a short, complete "
+    "sentence suitable for being read aloud by TTS — no markdown, no "
+    "bullet symbols, no headers, just plain numbered sentences. Aim for "
+    "10-16 steps covering Dark Age villager allocation through the Feudal "
+    "Age click and into early production habits."
+)
+
+DEFAULT_TRAINER_BUILD = "standard scouts-into-castle-age economy opening"
+
+
+def _parse_trainer_steps(raw: str) -> list[str]:
+    """Turn the LLM's numbered-line response into a list of step strings."""
+    import re
+    steps = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Strip leading numbering like "1.", "1)", "Step 1.", "Step 1:" etc.
+        cleaned = re.sub(r"^(?:step\s*)?\d+[\.\):]\s*", "", line, flags=re.IGNORECASE).strip()
+        if cleaned:
+            steps.append(cleaned)
+    return steps
+
+
 @bot.command(name="trainer")
-async def trainer(ctx: commands.Context):
-    """!trainer — Bot joins your VC and narrates the eco build order step by step. Type !next to advance."""
+async def trainer(ctx: commands.Context, *, build: str = None):
+    """!trainer [build] — Bot joins your VC and narrates an AI-generated build order step by step. Type !next to advance."""
+    if not cloud_llm.is_configured():
+        await ctx.send(
+            "⚠️ The voice trainer needs the AI backend configured first. "
+            "Set OPENCLAW_ENDPOINT, OPENCLAW_API_KEY, and OPENCLAW_MODEL in "
+            "the bot's .env, then run `!trainer` again."
+        )
+        return
+
     if ctx.author.voice is None:
         await ctx.send("❌ Join a voice channel first, then run `!trainer`.")
         return
@@ -2169,6 +1727,21 @@ async def trainer(ctx: commands.Context):
         await ctx.send(
             "❌ `gTTS` is not installed. Run `pip install gTTS` and ensure FFmpeg is on your PATH."
         )
+        return
+
+    build_request = build or DEFAULT_TRAINER_BUILD
+    async with ctx.typing():
+        raw_steps = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: cloud_llm.ask(
+                f"Age of Empires II build order to narrate: {build_request}",
+                system=TRAINER_SYSTEM_PROMPT,
+            ),
+        )
+    trainer_steps = _parse_trainer_steps(raw_steps)
+
+    if not trainer_steps:
+        await ctx.send("⚠️ The AI didn't return any usable steps. Try `!trainer` again or with a different build.")
         return
 
     guild_id = ctx.guild.id
@@ -2192,8 +1765,8 @@ async def trainer(ctx: commands.Context):
     embed = discord.Embed(
         title="🎙️ Economy Trainer — Voice Mode",
         description=(
-            f"Joined **{vc.name}**. Starting narration.\n\n"
-            f"Total steps: **{len(TRAINER_STEPS)}**\n"
+            f"Joined **{vc.name}**. Starting narration for: **{build_request}**\n\n"
+            f"Total steps: **{len(trainer_steps)}**\n"
             "Type `!next` to advance manually, or `!trainer stop` to end."
         ),
         color=C_ECO,
@@ -2201,14 +1774,14 @@ async def trainer(ctx: commands.Context):
     await ctx.send(embed=embed)
 
     step = 0
-    while step < len(TRAINER_STEPS) and guild_id in trainer_sessions:
+    while step < len(trainer_steps) and guild_id in trainer_sessions:
         trainer_sessions[guild_id]["step"] = step
-        text = TRAINER_STEPS[step]
+        text = trainer_steps[step]
 
         # Send text to channel so player can read along
         await ctx.send(
             embed=discord.Embed(
-                title=f"🔊 Step {step + 1} / {len(TRAINER_STEPS)}",
+                title=f"🔊 Step {step + 1} / {len(trainer_steps)}",
                 description=text,
                 color=C_ECO,
             )
@@ -2244,7 +1817,7 @@ async def trainer(ctx: commands.Context):
 
     trainer_sessions.pop(guild_id, None)
 
-    if step >= len(TRAINER_STEPS):
+    if step >= len(trainer_steps):
         await ctx.send(
             embed=discord.Embed(
                 title="🏆 Training Complete!",
@@ -2284,7 +1857,6 @@ from collections import defaultdict
 SAVEGAME_PATHS = [
     r"D:\Program Files (x86)\Microsoft Games\Age of Empires II\Voobly Mods\AOC\Data Mods\v1.6 Game Data\SaveGame",
 ]
-PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
 
 
 def _scan_recordings() -> list[str]:
@@ -2355,199 +1927,35 @@ def _parse_recording(filepath: str) -> dict:
         return {"file": os.path.basename(filepath), "error": err}
 
 
-def _build_profiles(games: list[dict]) -> dict:
-    """Aggregate per-player stats across all parsed games."""
-    raw: dict[str, dict] = defaultdict(lambda: {
-        "games": 0, "wins": 0,
-        "civs": defaultdict(int),
-        "maps": defaultdict(int),
-        "durations": [],
-        "last_seen": "",
-    })
+MYGAMES_SYSTEM_PROMPT = (
+    "You are an Age of Empires II analyst. You're given a compact summary "
+    "of a player's recent recorded games (map, date, duration, players, "
+    "civs, winner) and you produce a short natural-language recap: overall "
+    "results, civ variety/preferences, common matchups, and any trends "
+    "worth noting (e.g. frequently losing on certain maps, repeating a "
+    "civ). Be concise and concrete — reference actual games from the data, "
+    "don't invent details that aren't there. Keep it to a few short "
+    "paragraphs or bullet points, fitting in a Discord embed."
+)
 
+
+def _summarize_games_for_llm(games: list[dict], player_name: str | None) -> str:
+    lines = []
     for g in games:
-        if "error" in g:
-            continue
-        for p in g.get("players", []):
-            name = p["name"]
-            r = raw[name]
-            r["games"] += 1
-            if p["winner"]:
-                r["wins"] += 1
-            r["civs"][p["civ"]] += 1
-            r["maps"][g["map"]] += 1
-            if g["duration_min"]:
-                r["durations"].append(g["duration_min"])
-            if g["date"] > r["last_seen"]:
-                r["last_seen"] = g["date"]
-
-    profiles: dict[str, dict] = {}
-    for name, r in raw.items():
-        win_rate = round(r["wins"] / r["games"] * 100) if r["games"] else 0
-        avg_len  = round(sum(r["durations"]) / len(r["durations"]), 1) if r["durations"] else None
-
-        civs_sorted = sorted(r["civs"].items(), key=lambda x: -x[1])
-        maps_sorted = sorted(r["maps"].items(), key=lambda x: -x[1])
-
-        # Simple weakness heuristics based on available stats
-        weaknesses = []
-        if win_rate < 40:
-            weaknesses.append("Win rate below 40% — review your Castle Age transition")
-        if avg_len and avg_len > 35:
-            weaknesses.append(f"Average game length {avg_len} min — games are going late, work on early pressure")
-        if avg_len and avg_len < 12:
-            weaknesses.append("Very short games — possibly early resigns, work on defensive play")
-        civ_count = len(civs_sorted)
-        if civ_count == 1:
-            weaknesses.append(f"Only playing {civs_sorted[0][0]} — opponent can prepare a hard counter every game")
-        if not weaknesses:
-            weaknesses.append("No obvious weaknesses detected from available data")
-
-        strengths = []
-        if win_rate >= 60:
-            strengths.append(f"Strong win rate ({win_rate}%)")
-        if civ_count >= 4:
-            strengths.append(f"Good civ variety ({civ_count} different civs played)")
-        if avg_len and 18 <= avg_len <= 30:
-            strengths.append(f"Efficient game pace ({avg_len} min avg) — strong mid-game")
-        if not strengths:
-            strengths.append("Keep playing — more data needed for strength analysis")
-
-        profiles[name] = {
-            "games":        r["games"],
-            "wins":         r["wins"],
-            "win_rate":     win_rate,
-            "avg_game_min": avg_len,
-            "favourite_civ":  civs_sorted[0][0] if civs_sorted else "Unknown",
-            "civ_breakdown":  {k: v for k, v in civs_sorted[:5]},
-            "favourite_map":  maps_sorted[0][0] if maps_sorted else "Unknown",
-            "map_breakdown":  {k: v for k, v in maps_sorted[:5]},
-            "last_seen":      r["last_seen"],
-            "strengths":      strengths,
-            "weaknesses":     weaknesses,
-        }
-    return profiles
-
-
-def _load_profiles() -> dict:
-    if os.path.exists(PROFILES_FILE):
-        with open(PROFILES_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    return {}
-
-
-def _save_profiles(profiles: dict):
-    with open(PROFILES_FILE, "w", encoding="utf-8") as fh:
-        json.dump(profiles, fh, indent=2, ensure_ascii=False)
-
-
-@bot.command(name="analyze")
-async def analyze(ctx: commands.Context):
-    """!analyze — Scan all recorded games and build player profiles."""
-    msg = await ctx.send("🔍 Scanning SaveGame folders for recordings…")
-
-    recordings = _scan_recordings()
-    if not recordings:
-        await msg.edit(content="❌ No `.mgz` files found in your SaveGame folders.")
-        return
-
-    await msg.edit(content=f"📂 Found **{len(recordings)}** recordings. Parsing… (this may take 30-60 seconds)")
-
-    games = []
-    errors = 0
-    skipped = 0
-    for rec in recordings:
-        parsed = await asyncio.get_event_loop().run_in_executor(None, _parse_recording, rec)
-        if parsed is None:
-            skipped += 1
-            continue
-        if "error" in parsed:
-            errors += 1
-        games.append(parsed)
-
-    profiles = _build_profiles(games)
-    _save_profiles(profiles)
-
-    valid = len(games) - errors
-    embed = discord.Embed(
-        title="✅ Analysis Complete",
-        description=(
-            f"Parsed **{valid}/{len(recordings)}** recordings successfully."
-            + (f" ({skipped} lobby/abandoned saves skipped)" if skipped else "")
-        ),
-        color=C_TEAMS,
-    )
-    embed.add_field(
-        name="Players found",
-        value="\n".join(
-            f"**{name}** — {p['games']} games, {p['win_rate']}% WR, fav civ: {p['favourite_civ']}"
-            for name, p in sorted(profiles.items(), key=lambda x: -x[1]["games"])
-        ) or "No players found",
-        inline=False,
-    )
-    if errors:
-        embed.add_field(name="⚠️ Parse errors", value=f"{errors} files failed (run `pip install mgz` if not installed)", inline=False)
-    embed.set_footer(text=f"Profiles saved to profiles.json | Use !profile <name> to view details")
-    await msg.edit(content=None, embed=embed)
-
-
-@bot.command(name="profile")
-async def profile_cmd(ctx: commands.Context, *, player_name: str = None):
-    """!profile [name] — Show a player's stats and strategic profile from recorded games."""
-    profiles = _load_profiles()
-
-    if not profiles:
-        await ctx.send("❌ No profiles found. Run `!analyze` first.")
-        return
-
-    if player_name is None:
-        names = ", ".join(f"`{n}`" for n in sorted(profiles.keys()))
-        await ctx.send(f"Usage: `!profile PlayerName`\nKnown players: {names}")
-        return
-
-    # Fuzzy match
-    key = next((k for k in profiles if k.lower() == player_name.lower()), None)
-    if key is None:
-        key = next((k for k in profiles if player_name.lower() in k.lower()), None)
-    if key is None:
-        await ctx.send(f"❌ Player `{player_name}` not found. Known: {', '.join(profiles.keys())}")
-        return
-
-    p = profiles[key]
-    wr_icon = "🟢" if p["win_rate"] >= 55 else ("🟡" if p["win_rate"] >= 40 else "🔴")
-
-    embed = discord.Embed(
-        title=f"🧠 Strategic Profile: {key}",
-        color=C_CIV,
-    )
-    embed.add_field(name="📊 Stats", value=(
-        f"{wr_icon} **Win Rate:** {p['win_rate']}% ({p['wins']}/{p['games']} games)\n"
-        f"⏱️ **Avg Game Length:** {p['avg_game_min']} min\n"
-        f"🏅 **Favourite Civ:** {p['favourite_civ']}\n"
-        f"🗺️ **Favourite Map:** {p['favourite_map']}\n"
-        f"📅 **Last Seen:** {p['last_seen']}"
-    ), inline=False)
-
-    civ_breakdown = " · ".join(f"{c} ×{n}" for c, n in p["civ_breakdown"].items())
-    embed.add_field(name="⚔️ Civs Played", value=civ_breakdown or "No data", inline=False)
-
-    embed.add_field(
-        name="✅ Strengths",
-        value="\n".join(f"• {s}" for s in p["strengths"]),
-        inline=False,
-    )
-    embed.add_field(
-        name="⚠️ Weaknesses",
-        value="\n".join(f"• {w}" for w in p["weaknesses"]),
-        inline=False,
-    )
-    embed.set_footer(text="Run !analyze to refresh profiles after new games.")
-    await ctx.send(embed=embed)
+        player_bits = ", ".join(
+            f"{p['name']} ({p['civ']}{', winner' if p['winner'] else ''})"
+            for p in g["players"]
+        )
+        lines.append(
+            f"- {g['map']} | {g['date']} | {g['duration_min']} min | {player_bits}"
+        )
+    header = f"Recent games for {player_name}:" if player_name else "Recent games:"
+    return header + "\n" + "\n".join(lines)
 
 
 @bot.command(name="mygames")
 async def mygames(ctx: commands.Context, *, player_name: str = None):
-    """!mygames [name] — Show recent game history from recorded games."""
+    """!mygames [name] — AI recap/analysis of recent game history from recorded games."""
     recordings = _scan_recordings()
     if not recordings:
         await ctx.send("❌ No recordings found in SaveGame folders.")
@@ -2571,22 +1979,25 @@ async def mygames(ctx: commands.Context, *, player_name: str = None):
         await ctx.send("❌ No games found.")
         return
 
+    games_for_summary = results[:8]
+    summary_text = _summarize_games_for_llm(games_for_summary, player_name)
+    prompt = (
+        f"{summary_text}\n\n"
+        "Write a recap/analysis of these recent games."
+    )
+
+    async with ctx.typing():
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: cloud_llm.safe_ask(prompt, system=MYGAMES_SYSTEM_PROMPT),
+        )
+
     embed = discord.Embed(
-        title=f"📼 Recent Games{' for ' + player_name if player_name else ''}",
+        title=f"📼 Recent Games Recap{' for ' + player_name if player_name else ''}",
+        description=answer,
         color=C_DRAFT,
     )
-    for g in results[:8]:
-        winner_names = [p["name"] for p in g["players"] if p["winner"]]
-        player_line = " vs ".join(
-            f"**{p['name']}** ({p['civ']})" + (" 🏆" if p["winner"] else "")
-            for p in g["players"]
-        )
-        embed.add_field(
-            name=f"🗺️ {g['map']}  ·  {g['date']}  ·  {g['duration_min']} min",
-            value=player_line,
-            inline=False,
-        )
-    embed.set_footer(text=f"Showing last {len(results)} games from SaveGame folder")
+    embed.set_footer(text=f"Based on last {len(games_for_summary)} games from SaveGame folder")
     await ctx.send(embed=embed)
 
 
@@ -2649,15 +2060,23 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
         await ctx.send("❌ `gTTS` not installed. Run `pip install gTTS` and ensure FFmpeg is on PATH.")
         return
 
-    profiles = _load_profiles()
     target = player_name or ctx.author.display_name
 
-    # Find profile (fuzzy)
+    # Fetch the player's synthesized strategic profile from MinIO (written by
+    # pipeline 3) — the same source as !ask. Replaces the old local
+    # profiles.json system.
     profile = None
-    for k, v in profiles.items():
-        if target.lower() in k.lower():
-            profile = (k, v)
-            break
+    try:
+        from pipeline.s3_store import get_profile
+        profile, _ = get_profile(target)
+    except FileNotFoundError:
+        profile = None
+    except Exception as exc:  # storage unreachable — degrade to general coaching
+        await ctx.send(
+            f"⚠️ Couldn't reach the profile store (`{type(exc).__name__}`); "
+            "giving general coaching instead."
+        )
+        profile = None
 
     guild_id = ctx.guild.id
     if guild_id in trainer_sessions:
@@ -2669,33 +2088,38 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
     voice_client = await vc_channel.connect()
     trainer_sessions[guild_id] = {"vc": voice_client, "step": 0, "ctx": ctx}
 
-    # Build personalised script
+    # Build personalised script from the synthesized profile's behavioural
+    # sections (caveats omitted — it's a data-coverage note, not coaching).
     script = [COACH_INTRO]
 
     if profile:
-        name, p = profile
+        pname = profile.get("player_name", target)
+        n_matches = profile.get("n_matches", "several")
         script.append(
-            f"I have found a profile for {name} with {p['games']} recorded games "
-            f"and a {p['win_rate']} percent win rate."
+            f"I found a strategic profile for {pname}, "
+            f"synthesized from {n_matches} recorded matches."
         )
-        script.append(
-            f"Your favourite civilization is {p['favourite_civ']} "
-            f"and your favourite map is {p['favourite_map']}."
-        )
-        for w in p["weaknesses"]:
-            script.append(f"Area to improve: {w}")
-        for s in p["strengths"]:
-            script.append(f"Keep doing this: {s}")
+        for key, label in (
+            ("playstyle", "Your overall playstyle"),
+            ("economy", "On your economy"),
+            ("aggression", "On aggression"),
+            ("defense", "On defense"),
+            ("teamwork", "On teamwork"),
+            ("tendencies", "Your tendencies and strengths"),
+        ):
+            text = (profile.get(key) or "").strip()
+            if text:
+                script.append(f"{label}: {text}")
     else:
         script.append(
-            f"No profile found for {target}. Run exclamation mark analyze after your next games. "
-            f"For now, I will give you general coaching."
+            f"No profile found for {target} yet. Profiles are built "
+            f"automatically from your replays. For now, here is general coaching."
         )
 
     script += COACH_GENERIC_TIPS
     script.append(
         "That concludes your coaching session. "
-        "Type exclamation mark analyze after each game session to keep your profile updated. Good luck."
+        "Your profile updates automatically as you play more games. Good luck."
     )
 
     embed = discord.Embed(
@@ -2704,8 +2128,11 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
         color=C_ECO,
     )
     if profile:
-        _, p = profile
-        embed.add_field(name="Profile loaded", value=f"{p['games']} games · {p['win_rate']}% WR · {p['favourite_civ']}", inline=False)
+        embed.add_field(
+            name="Profile loaded",
+            value=f"{profile.get('n_matches', '?')} matches · model `{profile.get('model', '?')}`",
+            inline=False,
+        )
     await ctx.send(embed=embed)
 
     for i, line in enumerate(script):
@@ -2744,7 +2171,7 @@ async def on_ready():
     print(f"✅ {bot.user} is online and ready.")
     print(f"   Commands: !draft  !teams  !lobby  !reset  !civ  !has  !counter")
     print(f"             !eco  !build  !random  !hotkeys  !trainer")
-    print(f"             !analyze  !profile  !mygames  !coach  !ask")
+    print(f"             !mygames  !coach  !ask")
     start_savegame_watcher()
 
 
