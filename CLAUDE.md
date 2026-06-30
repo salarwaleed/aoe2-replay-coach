@@ -26,6 +26,9 @@ This project has five skills under `.claude/skills/`: `spawn-worker`, `verify-fi
 
 A good candidate skill is a procedure, not a one-time fact: something with steps that would be done the same way again, not a fact specific to this one task.
 
+## User interaction preferences
+- **Use the structured multiple-choice question tool (AskUserQuestion) whenever the user needs to make a decision** — not just in the "genuinely blocked" cases the tool default-suggests, but as the default presentation for any real choice between options (architectural decisions, picking between approaches, confirming a next step). The user explicitly asked for this format over plain-text questions.
+
 ## Mentorship — the user is new to Claude Code and to development
 
 The user is learning both Claude Code itself and software development as they go. Beyond just completing tasks, proactively act as a mentor:
