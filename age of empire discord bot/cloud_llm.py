@@ -158,6 +158,64 @@ def ask(
     )
 
 
+def transcribe(audio_bytes: bytes, *, mime: str = "audio/wav", timeout: float | None = None) -> str:
+    """Transcribe speech audio via Gemini inline audio. Returns the transcript
+    text (may be empty if no speech). Raises CloudLLMNotConfigured if not set up;
+    only supports the 'gemini' API style."""
+    if not is_configured():
+        raise CloudLLMNotConfigured(_NOT_CONFIGURED_MSG)
+
+    import base64
+    import time
+    import requests
+
+    c = _cfg()
+    if c["style"] != "gemini":
+        raise RuntimeError(
+            f"transcribe() only supports OPENCLAW_API_STYLE=gemini, "
+            f"but OPENCLAW_API_STYLE={c['style']!r}."
+        )
+
+    effective_timeout = timeout if timeout is not None else c["timeout"]
+
+    b64 = base64.b64encode(audio_bytes).decode("ascii")
+    body = {
+        "contents": [{"role": "user", "parts": [
+            {"text": "Transcribe the speech in this audio verbatim. Output ONLY the spoken words, no commentary. If there is no clear speech, output nothing."},
+            {"inline_data": {"mime_type": mime, "data": b64}},
+        ]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+
+    _TRANSIENT = {429, 500, 502, 503, 504}
+    last = None
+    for attempt in range(3):
+        resp = requests.post(
+            f"{c['endpoint']}?key={c['api_key']}",
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=effective_timeout,
+        )
+        if resp.status_code in _TRANSIENT:
+            last = requests.HTTPError(f"{resp.status_code} transient server error")
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        resp.raise_for_status()
+        last = None
+        break
+    if last is not None:
+        raise last
+
+    data = resp.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return ""  # no speech detected — not an error for transcription
+    cand = candidates[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts).strip()
+    return text  # may be "" if model produced nothing — caller handles that
+
+
 def safe_ask(prompt: str, **kwargs) -> str:
     """Like `ask`, but returns a user-facing message instead of raising when
     the backend isn't configured or when an HTTP error occurs."""
