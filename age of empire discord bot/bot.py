@@ -34,6 +34,23 @@ import reference_loader
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# Maps Discord display names to Voobly usernames for profile lookup.
+# Edit this dict to add new players. Key = Discord display name, Value = Voobly username.
+DISCORD_TO_VOOBLY: dict[str, str] = {
+    "SalarWaleed": "SalarWaleed",
+    "Player2": "Player2",
+    "Player3": "Player3",
+    "Player4": "Player4",
+    "Player5": "Player5",
+    "Player6": "Player6",
+    "Player6": "Player6",
+    "Player7": "Player7",
+    "Player9": "Player9",
+    "Player8": "Player8",
+}
+
+_match_session: dict[str, list[str]] = {"ally": [], "enemy": []}
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -1536,7 +1553,8 @@ ECO_SYSTEM_PROMPT = (
     "paragraphs or bullet points. Keep answers tight enough to fit in a "
     "Discord embed — a few hundred words at most. Do not pad with "
     "disclaimers."
-) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "")
+) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
+  + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
 
 
 def _build_profile_addendum(profile: dict | None) -> str:
@@ -1576,6 +1594,34 @@ def _lookup_profile_silently(target: str) -> dict | None:
         return None
 
 
+def _format_profile_for_context(profile: dict) -> str:
+    lines = []
+    for key, label in (
+        ("playstyle", "Playstyle"),
+        ("economy", "Economy"),
+        ("aggression", "Aggression"),
+        ("defense", "Defense"),
+        ("tendencies", "Tendencies"),
+    ):
+        text = (profile.get(key) or "").strip()
+        if text:
+            lines.append(f"{label}: {text}")
+    return "\n".join(lines)
+
+
+def _build_match_context() -> str:
+    parts = []
+    for role in ("ally", "enemy"):
+        for name in _match_session.get(role, []):
+            profile = _lookup_profile_silently(name)
+            if profile:
+                inner = _format_profile_for_context(profile)
+                parts.append(f'<player role="{role}" name="{name}">\n{inner}\n</player>')
+            else:
+                parts.append(f'<player role="{role}" name="{name}">No match history available.</player>')
+    return "\n".join(parts)
+
+
 @bot.command(name="eco")
 async def eco(ctx: commands.Context, *, query: str = None):
     """
@@ -1601,13 +1647,68 @@ async def eco(ctx: commands.Context, *, query: str = None):
     profile = _lookup_profile_silently(ctx.author.display_name)
     prompt += _build_profile_addendum(profile)
 
+    match_ctx = _build_match_context()
+    if match_ctx:
+        prompt += f"\n\n<match_context>\n{match_ctx}\n</match_context>"
+    _sys = ECO_SYSTEM_PROMPT + (MATCHUP_CHAIN_OF_THOUGHT if match_ctx else "")
+
     async with ctx.typing():
         answer = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: cloud_llm.safe_ask(prompt, system=ECO_SYSTEM_PROMPT),
+            lambda: cloud_llm.safe_ask(prompt, system=_sys),
         )
 
     embed = discord.Embed(title=title, description=answer, color=C_ECO)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="match")
+async def match_session(ctx: commands.Context, *, args: str = ""):
+    """
+    !match ally salar player3 enemy player2 player6  — set current match teams
+    !match status                                — show current session
+    !match reset                                 — clear session
+    """
+    global _match_session
+    tokens = args.strip().split() if args.strip() else []
+
+    if not tokens or tokens[0] == "status":
+        ally = ", ".join(_match_session["ally"]) or "none"
+        enemy = ", ".join(_match_session["enemy"]) or "none"
+        embed = discord.Embed(title="⚔️ Match Session", color=0x2ECC71)
+        embed.add_field(name="Ally", value=ally, inline=False)
+        embed.add_field(name="Enemy", value=enemy, inline=False)
+        await ctx.send(embed=embed)
+        return
+
+    if tokens[0] == "reset":
+        _match_session = {"ally": [], "enemy": []}
+        await ctx.send("Match session cleared.")
+        return
+
+    # Parse: !match ally a b c enemy x y z  (ally/enemy keywords as separators)
+    new_session: dict[str, list[str]] = {"ally": [], "enemy": []}
+    current_role: str | None = None
+    for tok in tokens:
+        if tok.lower() in ("ally", "allies", "team"):
+            current_role = "ally"
+        elif tok.lower() in ("enemy", "enemies", "vs", "opponent", "opponents"):
+            current_role = "enemy"
+        elif current_role is not None:
+            new_session[current_role].append(tok)
+
+    if not new_session["ally"] and not new_session["enemy"]:
+        await ctx.send(
+            "Usage: `!match ally salar player3 enemy player2 player6` | `!match status` | `!match reset`"
+        )
+        return
+
+    _match_session = new_session
+    ally = ", ".join(_match_session["ally"]) or "none"
+    enemy = ", ".join(_match_session["enemy"]) or "none"
+    embed = discord.Embed(title="⚔️ Match Session Set", color=0x2ECC71)
+    embed.add_field(name="Ally", value=ally, inline=False)
+    embed.add_field(name="Enemy", value=enemy, inline=False)
     await ctx.send(embed=embed)
 
 
@@ -1631,7 +1732,8 @@ BUILD_SYSTEM_PROMPT = (
     "for it when relevant. Keep the answer tight enough for a Discord "
     "embed — a few hundred words at most. Use bullet points or numbered "
     "steps."
-) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "")
+) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
+  + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
 
 
 @bot.command(name="build")
@@ -1660,10 +1762,15 @@ async def build_order(ctx: commands.Context, *, opening: str = None):
     profile = _lookup_profile_silently(ctx.author.display_name)
     prompt += _build_profile_addendum(profile)
 
+    match_ctx = _build_match_context()
+    if match_ctx:
+        prompt += f"\n\n<match_context>\n{match_ctx}\n</match_context>"
+    _sys = BUILD_SYSTEM_PROMPT + (MATCHUP_CHAIN_OF_THOUGHT if match_ctx else "")
+
     async with ctx.typing():
         answer = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: cloud_llm.safe_ask(prompt, system=BUILD_SYSTEM_PROMPT),
+            lambda: cloud_llm.safe_ask(prompt, system=_sys),
         )
 
     embed = discord.Embed(title=title, description=answer, color=C_BUILD)
@@ -1769,6 +1876,15 @@ TRAINER_SYSTEM_PROMPT = (
     "steps covering Town Center placement and villager allocation through "
     "the transition into early production habits."
 ) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "")
+
+MATCHUP_CHAIN_OF_THOUGHT = (
+    "\n\nYou have been given player profiles tagged <player role=\"ally\"> and "
+    "<player role=\"enemy\">. Reason in this exact sequence: "
+    "1) THREAT — when and how will the enemies attack based on their profile? "
+    "2) MATH — using the game rates above, what resources/villagers does the ally need to counter? "
+    "3) BUILD — give a numbered step-by-step recommendation (8–12 steps). "
+    "Be specific to the profiles given. Do not give generic advice."
+)
 
 DEFAULT_TRAINER_BUILD = "standard pocket-boom opening with a 2nd and 3rd Town Center"
 
@@ -2198,6 +2314,24 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
             f"No profile found for {target} yet. Profiles are built "
             f"automatically from your replays. For now, here is general coaching."
         )
+
+    # If a match session is active, inject a match-aware coaching segment.
+    match_ctx = _build_match_context()
+    if match_ctx and cloud_llm.is_configured():
+        coach_prompt = (
+            f"You are coaching {target} for an upcoming match. "
+            "Give 3 to 5 spoken coaching tips specifically about this matchup. "
+            "Each tip should be one short sentence, suitable for text-to-speech. "
+            "Focus on the opponent threats and how to counter them."
+            f"\n\n<match_context>\n{match_ctx}\n</match_context>"
+        )
+        _coach_sys = ECO_SYSTEM_PROMPT + MATCHUP_CHAIN_OF_THOUGHT
+        raw_match_tips = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: cloud_llm.safe_ask(coach_prompt, system=_coach_sys),
+        )
+        for tip in _parse_trainer_steps(raw_match_tips):
+            script.append(tip)
 
     script += COACH_GENERIC_TIPS
     script.append(

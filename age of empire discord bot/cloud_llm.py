@@ -101,17 +101,19 @@ def ask(
 
     # Native Gemini :generateContent shape (used if OPENCLAW_API_STYLE=gemini).
     if c["style"] == "gemini":
-        parts_text = (f"{system}\n\n" if system else "") + prompt
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        if system:
+            body["system_instruction"] = {"parts": [{"text": system}]}
         resp = requests.post(
             f"{c['endpoint']}?key={c['api_key']}",
             headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": parts_text}]}],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_tokens,
-                },
-            },
+            json=body,
             timeout=c["timeout"],
         )
         resp.raise_for_status()
