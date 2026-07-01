@@ -28,6 +28,9 @@ from savegame_watcher import start_savegame_watcher
 # module rather than calling an HTTP API directly. See cloud_llm.py.
 import cloud_llm
 
+# Static ruleset reference data injected into LLM system prompts.
+import reference_loader
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -1533,7 +1536,7 @@ ECO_SYSTEM_PROMPT = (
     "paragraphs or bullet points. Keep answers tight enough to fit in a "
     "Discord embed — a few hundred words at most. Do not pad with "
     "disclaimers."
-)
+) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "")
 
 
 def _build_profile_addendum(profile: dict | None) -> str:
@@ -1628,7 +1631,7 @@ BUILD_SYSTEM_PROMPT = (
     "for it when relevant. Keep the answer tight enough for a Discord "
     "embed — a few hundred words at most. Use bullet points or numbered "
     "steps."
-)
+) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "")
 
 
 @bot.command(name="build")
@@ -1765,7 +1768,7 @@ TRAINER_SYSTEM_PROMPT = (
     "symbols, no headers, just plain numbered sentences. Aim for 10-16 "
     "steps covering Town Center placement and villager allocation through "
     "the transition into early production habits."
-)
+) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "")
 
 DEFAULT_TRAINER_BUILD = "standard pocket-boom opening with a 2nd and 3rd Town Center"
 
