@@ -73,6 +73,8 @@ def ask(
     if not is_configured():
         raise CloudLLMNotConfigured(_NOT_CONFIGURED_MSG)
 
+    import time
+
     import requests  # local import: only needed when actually calling out
 
     c = _cfg()
@@ -81,22 +83,36 @@ def ask(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # Transient statuses worth a quick retry (Gemini is prone to 503 overloads).
+    _TRANSIENT = {429, 500, 502, 503, 504}
+
+    def _post_with_retry(url: str, headers: dict, json_body: dict):
+        last = None
+        for attempt in range(3):
+            resp = requests.post(url, headers=headers, json=json_body, timeout=c["timeout"])
+            if resp.status_code in _TRANSIENT:
+                # Clean message (no URL/key) so it can't leak the API key upstream.
+                last = requests.HTTPError(f"{resp.status_code} transient server error")
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp
+        raise last  # exhausted retries on a transient error
+
     if c["style"] == "openai":
-        resp = requests.post(
+        resp = _post_with_retry(
             c["endpoint"],
-            headers={
+            {
                 "Authorization": f"Bearer {c['api_key']}",
                 "Content-Type": "application/json",
             },
-            json={
+            {
                 "model": c["model"],
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             },
-            timeout=c["timeout"],
         )
-        resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
     # Native Gemini :generateContent shape (used if OPENCLAW_API_STYLE=gemini).
@@ -106,18 +122,36 @@ def ask(
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
+                # Disable hidden "thinking" (2.5 flash): thinking tokens count
+                # against maxOutputTokens and can starve the visible answer,
+                # yielding an empty response. Our chain-of-thought is prompt-driven
+                # (the model writes its reasoning as normal output) so we don't
+                # need the internal thinking budget.
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
         if system:
             body["system_instruction"] = {"parts": [{"text": system}]}
-        resp = requests.post(
+        resp = _post_with_retry(
             f"{c['endpoint']}?key={c['api_key']}",
-            headers={"Content-Type": "application/json"},
-            json=body,
-            timeout=c["timeout"],
+            {"Content-Type": "application/json"},
+            body,
         )
-        resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(
+                "the model returned no answer (it may have been blocked by a safety filter)."
+            )
+        cand = candidates[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts).strip()
+        if not text:
+            reason = cand.get("finishReason", "unknown")
+            raise RuntimeError(
+                f"the model returned an empty answer (finishReason={reason}); try again."
+            )
+        return text
 
     raise CloudLLMNotConfigured(
         f"Unknown OPENCLAW_API_STYLE={c['style']!r}; expected 'openai' or 'gemini'."
@@ -126,7 +160,14 @@ def ask(
 
 def safe_ask(prompt: str, **kwargs) -> str:
     """Like `ask`, but returns a user-facing message instead of raising when
-    the backend isn't configured. Use this from command handlers."""
+    the backend isn't configured or when an HTTP error occurs."""
     if not is_configured():
         return f"⚠️ {_NOT_CONFIGURED_MSG}"
-    return ask(prompt, **kwargs)
+    try:
+        return ask(prompt, **kwargs)
+    except Exception as exc:
+        # Strip the URL (which contains the API key) from the error message.
+        msg = str(exc)
+        if "http" in msg.lower() or "url" in msg.lower() or "key=" in msg.lower():
+            return "⚠️ LLM request failed — check OPENCLAW credentials and model name in .env."
+        return f"⚠️ LLM error: {msg}"

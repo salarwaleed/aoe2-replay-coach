@@ -38,7 +38,7 @@ def _client():
     try:
         import boto3
     except ImportError as exc:  # pragma: no cover - environment guard
-        raise SystemExit(
+        raise ImportError(
             "boto3 is not installed. Run:\n"
             "    pip install -r pipeline/requirements.txt"
         ) from exc
