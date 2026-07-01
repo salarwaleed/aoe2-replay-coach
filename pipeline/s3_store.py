@@ -152,3 +152,23 @@ def get_profile(player_name: str, client=None) -> tuple[dict, str]:
     markdown_text = md_resp["Body"].read().decode("utf-8")
 
     return json_obj, markdown_text
+
+
+def list_profiles(client=None) -> list[str]:
+    """Return the names of all players that have a stored profile.
+
+    Enumerates ``profiles/{name}/profile.json`` keys in the bucket. Returns an
+    empty list if the bucket is empty. Lets connection errors propagate — the
+    caller decides how to degrade.
+    """
+    client = client or _client()
+    names: list[str] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix="profiles/"):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/profile.json"):
+                name = key[len("profiles/"):-len("/profile.json")]
+                if name:
+                    names.append(name)
+    return names

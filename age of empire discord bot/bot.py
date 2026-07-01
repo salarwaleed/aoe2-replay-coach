@@ -68,6 +68,7 @@ C_ECO     = 0xF1C40F   # yellow
 C_COUNTER = 0xE74C3C   # red
 C_BUILD   = 0x9B59B6   # purple
 C_INFO    = 0x95A5A6   # grey
+C_GG      = 0x5865F2   # blurple (general chatbot)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 55-MAP POOL  (1.6 Map Pack, confirmed from local directory)
@@ -1556,6 +1557,22 @@ ECO_SYSTEM_PROMPT = (
 ) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
   + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
 
+GG_SYSTEM_PROMPT = (
+    "You are a helpful, knowledgeable Age of Empires II assistant for this "
+    "server's community, which plays a custom Voobly v1.6 ruleset (Imperial "
+    "Age start, high starting resources, multi-TC pocket boom meta — NOT "
+    "vanilla Age of Conquerors). Answer the user's question directly and "
+    "concisely, suitable for a Discord message. You may be given a block of "
+    "player profiles tagged <player name=\"...\">; when the question is about "
+    "specific players or comparisons between them, base your answer ONLY on "
+    "those profiles and say so plainly if a player has no profile or the data "
+    "doesn't cover what was asked — never invent stats. For general strategy "
+    "questions, apply your AoE2 knowledge grounded in the server ruleset and "
+    "game rates provided. Keep answers tight (a few hundred words max). Use "
+    "bullet points where it helps. Do not pad with disclaimers."
+) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
+  + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
+
 
 def _build_profile_addendum(profile: dict | None) -> str:
     """Build a short 'tailor your advice' addendum from a synthesized
@@ -1620,6 +1637,39 @@ def _build_match_context() -> str:
             else:
                 parts.append(f'<player role="{role}" name="{name}">No match history available.</player>')
     return "\n".join(parts)
+
+
+# Cache the assembled all-profiles context: profiles only change when pipeline 3
+# reruns (nightly), so we avoid re-fetching every profile on every !gg call.
+_ALL_PROFILES_CACHE: dict = {"ts": 0.0, "text": ""}
+_ALL_PROFILES_TTL = 300.0  # seconds
+
+
+def _build_all_profiles_context() -> str:
+    """Fetch every stored player profile and build one tagged context block.
+    Cached for _ALL_PROFILES_TTL seconds. Returns "" if storage is unreachable."""
+    import time
+    now = time.time()
+    if _ALL_PROFILES_CACHE["text"] and (now - _ALL_PROFILES_CACHE["ts"]) < _ALL_PROFILES_TTL:
+        return _ALL_PROFILES_CACHE["text"]
+    text = ""
+    try:
+        from pipeline.s3_store import list_profiles, get_profile
+        parts = []
+        for name in list_profiles():
+            try:
+                profile, _ = get_profile(name)
+            except Exception:
+                continue
+            inner = _format_profile_for_context(profile)
+            if inner:
+                parts.append(f'<player name="{name}">\n{inner}\n</player>')
+        text = "\n".join(parts)
+    except Exception:
+        text = ""
+    _ALL_PROFILES_CACHE["ts"] = now
+    _ALL_PROFILES_CACHE["text"] = text
+    return text
 
 
 @bot.command(name="eco")
@@ -2223,6 +2273,40 @@ async def ask_cmd(ctx: commands.Context, *, player_name: str = None):
     await ctx.send(embed=embed)
 
 
+@bot.command(name="gg")
+async def gg(ctx: commands.Context, *, question: str = None):
+    """
+    !gg <anything>   — ask the bot any AoE2 / server / player question
+    Examples:
+      !gg who is the most aggressive player?
+      !gg how do I beat a knight rush?
+      !gg compare player2 and player6
+    """
+    if not question:
+        await ctx.send(
+            "Ask me anything about the server, players, or strategy. "
+            "Example: `!gg who should I watch out for?`"
+        )
+        return
+
+    profiles_ctx = _build_all_profiles_context()
+    prompt = f"Question: {question}"
+    if profiles_ctx:
+        prompt += f"\n\n<player_profiles>\n{profiles_ctx}\n</player_profiles>"
+
+    async with ctx.typing():
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: cloud_llm.safe_ask(prompt, system=GG_SYSTEM_PROMPT, max_tokens=900),
+        )
+
+    # Discord embed description hard limit is 4096 chars.
+    if len(answer) > 4000:
+        answer = answer[:3997] + "..."
+    embed = discord.Embed(title=f"💬 {question[:200]}", description=answer, color=C_GG)
+    await ctx.send(embed=embed)
+
+
 # ── VOICE COACH ───────────────────────────────────────────────────────────────
 # !coach [player_name]
 # Bot joins VC and narrates personalised coaching based on their recorded profile.
@@ -2388,7 +2472,7 @@ async def on_ready():
     print(f"✅ {bot.user} is online and ready.")
     print(f"   Commands: !draft  !teams  !lobby  !reset  !civ  !has  !counter")
     print(f"             !eco  !build  !random  !hotkeys  !trainer")
-    print(f"             !mygames  !coach  !ask")
+    print(f"             !mygames  !coach  !ask  !gg")
     start_savegame_watcher()
 
 
