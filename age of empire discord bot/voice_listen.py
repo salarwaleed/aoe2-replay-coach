@@ -23,18 +23,6 @@ import wave
 
 from discord.ext import voice_recv
 
-# ── DAVE (E2EE) disable patch ─────────────────────────────────────────────────
-# discord.py 2.7.1 + davey advertises DAVE (max_dave_protocol_version=1) during
-# voice IDENTIFY, which causes Discord to E2EE-encrypt every incoming audio packet
-# INSIDE the xchacha20 transport layer.  discord-ext-voice-recv 0.5.2a179 has no
-# DAVE decryption, so decrypted_data is a DAVE-encrypted blob and Opus raises
-# "corrupted stream".  Patching this property to return 0 tells Discord we don't
-# support DAVE, so it never enables the E2EE layer and decrypted_data is plain Opus.
-# Voice SEND is unaffected: VoiceClient.can_encrypt also checks dave_session.ready,
-# which stays False when dave_protocol_version never advances beyond 0.
-from discord.voice_state import VoiceConnectionState as _VCS
-_VCS.max_dave_protocol_version = property(lambda self: 0)
-
 # ── PCM format delivered by discord-ext-voice-recv ──────────────────────────
 SRC_RATE  = 48_000   # 48 kHz
 SRC_WIDTH = 2        # 16-bit signed  (bytes per sample channel)
