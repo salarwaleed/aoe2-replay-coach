@@ -25,7 +25,7 @@
 5. Build Barracks/Stable (175W each) once wood income is established (~60–90s in)
 6. Transition to military when you have 40+ villagers and stable income across all resources
 
-**Stone note:** 300S covers exactly 3 TCs (100S × 3 additional = wait, 2 additional TCs = 200S, leaving 100S for early wall/tower or banking for a Castle later at 650S)
+**Stone note:** 300S starting → 200S on 2 additional TCs → 100S left. Bank it for early walls/towers or hold toward a Castle (650S).
 
 ## Villager Allocation Targets
 - **Early (0–2 min):** 60% Wood, 30% Food (farms), 10% Gold
