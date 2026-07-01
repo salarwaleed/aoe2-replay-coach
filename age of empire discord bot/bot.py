@@ -28,11 +28,18 @@ from savegame_watcher import start_savegame_watcher
 # module rather than calling an HTTP API directly. See cloud_llm.py.
 import cloud_llm
 
+# Voice listening — wake-word sink and PCM helpers.
+import voice_listen
+
 # Static ruleset reference data injected into LLM system prompts.
 import reference_loader
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ── Voice listener config ─────────────────────────────────────────────────────
+WAKE_WORD           = os.getenv("VOICE_WAKE_WORD", "teletron")
+REPLY_MAX_TOKENS    = int(os.getenv("VOICE_REPLY_MAX_TOKENS", "300"))
 
 # Maps Discord display names to Voobly usernames for profile lookup.
 # Edit this dict to add new players. Key = Discord display name, Value = Voobly username.
@@ -2467,12 +2474,161 @@ async def coach_cmd(ctx: commands.Context, *, player_name: str = None):
     await ctx.send("✅ Coaching session complete.")
 
 
+# ── VOICE LISTEN ─────────────────────────────────────────────────────────────
+# !listen           — start wake-word listening in the caller's voice channel
+# !listen test      — start in test mode: post every transcript to the channel
+# !listen stop      — stop listening and disconnect
+# ─────────────────────────────────────────────────────────────────────────────
+
+from discord.ext import voice_recv as _voice_recv
+
+
+@bot.command(name="listen")
+async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
+    """
+    !listen          — start Teletron-1 voice assistant in your voice channel
+    !listen test     — post transcripts to channel (useful for debugging STT)
+    !listen stop     — disconnect and stop listening
+    """
+    if ctx.guild is None:
+        await ctx.send("This command only works in a server.")
+        return
+
+    guild_id = ctx.guild.id
+    mode = mode.strip().lower()
+
+    # ── STOP ────────────────────────────────────────────────────────────────
+    if mode == "stop":
+        session = trainer_sessions.get(guild_id)
+        if session and session.get("listen"):
+            sink = session.get("sink")
+            if sink:
+                try:
+                    sink.cleanup()
+                except Exception:
+                    pass
+            vc = session.get("vc")
+            if vc and vc.is_connected():
+                await vc.disconnect()
+            trainer_sessions.pop(guild_id, None)
+            await ctx.send("Stopped listening.")
+        else:
+            await ctx.send("No active listen session for this server.")
+        return
+
+    # ── START ────────────────────────────────────────────────────────────────
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("You need to be in a voice channel first.")
+        return
+
+    channel = ctx.author.voice.channel
+
+    # Disconnect any existing session (trainer / coach / listen)
+    if guild_id in trainer_sessions:
+        old = trainer_sessions[guild_id]
+        old_sink = old.get("sink")
+        if old_sink:
+            try:
+                old_sink.cleanup()
+            except Exception:
+                pass
+        old_vc = old.get("vc")
+        if old_vc and old_vc.is_connected():
+            await old_vc.disconnect()
+        trainer_sessions.pop(guild_id, None)
+
+    # Connect with voice-recv client
+    vc = await channel.connect(cls=_voice_recv.VoiceRecvClient)
+
+    loop = asyncio.get_event_loop()
+
+    # Closure: on_utterance is called from run_coroutine_threadsafe
+    async def on_utterance(user, wav_bytes: bytes) -> None:
+        # Transcribe off the event loop thread so requests() doesn't block it
+        try:
+            text = await loop.run_in_executor(
+                None, lambda: cloud_llm.transcribe(wav_bytes)
+            )
+        except Exception as exc:
+            print(f"[listen] transcribe error: {exc}")
+            return
+
+        if not text:
+            return  # silence or unintelligible — skip
+
+        # ── TEST MODE: just echo transcript ─────────────────────────────────
+        if mode == "test":
+            await ctx.send(f"\U0001f5e3️ {user.display_name}: {text}")
+            return
+
+        # ── NORMAL MODE: wake-word gating ────────────────────────────────────
+        query = voice_listen.match_wake_word(text, WAKE_WORD)
+        if query is None:
+            return  # not addressed to the bot
+
+        if query == "":
+            # Just the wake word — prompt for a question
+            await _speak_step(vc, "Yes? Ask your question.", guild_id)
+            return
+
+        # Build grounded prompt (same pattern as !gg)
+        profiles_ctx = _build_all_profiles_context()
+        prompt = f"Question: {query}"
+        if profiles_ctx:
+            prompt += f"\n\n<player_profiles>\n{profiles_ctx}\n</player_profiles>"
+
+        match_ctx = _build_match_context()
+        if match_ctx:
+            prompt += f"\n\n<match_context>\n{match_ctx}\n</match_context>"
+
+        try:
+            answer = await loop.run_in_executor(
+                None,
+                lambda: cloud_llm.safe_ask(
+                    prompt, system=GG_SYSTEM_PROMPT, max_tokens=REPLY_MAX_TOKENS
+                ),
+            )
+        except Exception as exc:
+            print(f"[listen] LLM error: {exc}")
+            return
+
+        # Speak the answer
+        await _speak_step(vc, answer, guild_id)
+
+        # Also post a text embed for reference
+        short = answer[:2000] if len(answer) > 2000 else answer
+        embed = discord.Embed(
+            title=f"\U0001f3a4 {user.display_name}: {query[:150]}",
+            description=short,
+            color=C_GG,
+        )
+        await ctx.send(embed=embed)
+
+    # Build and start the sink
+    sink = voice_listen.WakeSink(loop, on_utterance)
+    vc.listen(sink)
+
+    trainer_sessions[guild_id] = {"vc": vc, "listen": True, "sink": sink}
+
+    if mode == "test":
+        await ctx.send(
+            f"\U0001f399️ Listening in **{channel.name}** (test mode) — "
+            "I'll post every transcript here. Say anything!"
+        )
+    else:
+        await ctx.send(
+            f"\U0001f399️ Listening in **{channel.name}**. "
+            f"Say “**{WAKE_WORD.title()}, <your question>**” to get an answer. "
+            "Use `!listen stop` to disconnect."
+        )
+
+
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} is online and ready.")
     print(f"   Commands: !draft  !teams  !lobby  !reset  !civ  !has  !counter")
     print(f"             !eco  !build  !random  !hotkeys  !trainer")
-    print(f"             !mygames  !coach  !ask  !gg")
+    print(f"             !mygames  !coach  !ask  !gg  !listen")
     start_savegame_watcher()
 
 
