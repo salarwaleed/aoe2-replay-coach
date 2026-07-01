@@ -16,12 +16,132 @@ from __future__ import annotations
 import asyncio
 import audioop
 import io
+import logging
 import re
 import threading
 import time
 import wave
 
 from discord.ext import voice_recv
+
+# ── DAVE (E2EE) decryption monkeypatch ───────────────────────────────────────
+#
+# Background
+# ----------
+# Discord enforces DAVE end-to-end encryption on all voice calls since
+# 2026-03-02 (voice close code 4017 if a client refuses DAVE).  The bot is a
+# full DAVE MLS participant: discord.py builds a davey.DaveSession and joins
+# the MLS group, so it holds all current media keys.
+#
+# discord-ext-voice-recv (0.5.2a179) handles the *transport* layer correctly
+# (xchacha20/xsalsa decrypt), but leaves the DAVE (SFrame/MLS) layer in place.
+# PacketDecoder._decode_packet therefore feeds a still-DAVE-encrypted blob to
+# Opus.decode(), which crashes with "OpusError: corrupted stream".
+#
+# The fix
+# -------
+# We monkey-patch PacketDecoder._decode_packet so that, just before the Opus
+# decode call, the packet's decrypted_data is DAVE-decrypted via the live
+# DaveSession.  The patched method:
+#
+#   1. Resolves the DaveSession from the VoiceRecvClient._connection attribute.
+#   2. Looks up the sender user_id via VoiceRecvClient._ssrc_to_id[self.ssrc].
+#   3. Calls dave_session.decrypt(user_id, MediaType.audio, packet.decrypted_data).
+#   4. Replaces packet.decrypted_data with the plain Opus bytes in-place.
+#   5. Falls through to the normal Opus decode.
+#
+# All failure paths (missing session, unknown ssrc, decrypt error) are guarded
+# — the original (still-DAVE-encrypted) data is passed through so the existing
+# OpusError is raised rather than a new crash.  This means the bot degrades
+# gracefully and does not crash if DAVE is unavailable or the session is not yet
+# ready.
+#
+# Object graph (confirmed from source inspection):
+#   sink.voice_client                   → VoiceRecvClient
+#   voice_client._connection            → VoiceConnectionState
+#   voice_client._connection.dave_session → davey.DaveSession  (or None)
+#   voice_client._ssrc_to_id[ssrc]      → sender user_id (int)
+
+_dave_log = logging.getLogger(__name__ + ".dave_patch")
+
+
+def _apply_dave_decrypt_patch() -> None:
+    """Monkey-patch PacketDecoder._decode_packet to DAVE-decrypt before Opus.
+
+    Safe to call multiple times — idempotent guard via _DAVE_PATCHED flag.
+    No-ops cleanly if davey is not importable.
+    """
+    try:
+        import davey as _davey
+    except ImportError:
+        _dave_log.warning("davey not importable; DAVE decrypt patch skipped")
+        return
+
+    from discord.ext.voice_recv.opus import PacketDecoder
+
+    # Idempotency guard
+    if getattr(PacketDecoder, "_DAVE_PATCHED", False):
+        return
+
+    _MediaType = _davey.MediaType
+    _orig_decode_packet = PacketDecoder._decode_packet
+
+    def _dave_decode_packet(self, packet):
+        """Patched _decode_packet: DAVE-decrypt before Opus decode."""
+        # Only intercept real packets (not FakePackets which have no audio)
+        if packet:
+            dave_session = None
+            try:
+                vc = self.sink.voice_client
+                conn = getattr(vc, "_connection", None)
+                if conn is not None:
+                    dave_session = getattr(conn, "dave_session", None)
+            except Exception:
+                pass  # belt-and-suspenders; never crash here
+
+            if dave_session is not None and dave_session.ready:
+                user_id = None
+                try:
+                    user_id = vc._ssrc_to_id.get(self.ssrc)
+                except Exception:
+                    pass
+
+                if user_id is not None:
+                    try:
+                        plain_opus = dave_session.decrypt(
+                            user_id, _MediaType.audio, packet.decrypted_data
+                        )
+                        packet.decrypted_data = plain_opus
+                        _dave_log.debug(
+                            "DAVE decrypt OK: ssrc=%s uid=%s len=%s→%s",
+                            self.ssrc, user_id,
+                            len(packet.decrypted_data), len(plain_opus),
+                        )
+                    except Exception as exc:
+                        # Decrypt failure: leave data as-is.  Opus will raise
+                        # OpusError which voice_recv handles gracefully.
+                        _dave_log.debug(
+                            "DAVE decrypt failed: ssrc=%s uid=%s err=%r",
+                            self.ssrc, user_id, exc,
+                        )
+                else:
+                    _dave_log.debug(
+                        "DAVE decrypt skipped: ssrc=%s not yet in ssrc_to_id",
+                        self.ssrc,
+                    )
+            # else: session not ready / not present → passthrough (unmodified)
+
+        return _orig_decode_packet(self, packet)
+
+    PacketDecoder._decode_packet = _dave_decode_packet
+    PacketDecoder._DAVE_PATCHED = True
+    _dave_log.info("DAVE decrypt patch applied to PacketDecoder._decode_packet")
+
+
+# Apply the patch at import time so it's active before any VoiceRecvClient is
+# created.  This is safe: the patch only wraps a method; no network or Discord
+# state is touched here.
+_apply_dave_decrypt_patch()
 
 # ── PCM format delivered by discord-ext-voice-recv ──────────────────────────
 SRC_RATE  = 48_000   # 48 kHz
