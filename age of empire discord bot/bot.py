@@ -68,7 +68,7 @@ C_ECO     = 0xF1C40F   # yellow
 C_COUNTER = 0xE74C3C   # red
 C_BUILD   = 0x9B59B6   # purple
 C_INFO    = 0x95A5A6   # grey
-C_GG      = 0x9B59B6   # purple (general chatbot)
+C_GG      = 0x5865F2   # blurple (general chatbot)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 55-MAP POOL  (1.6 Map Pack, confirmed from local directory)
