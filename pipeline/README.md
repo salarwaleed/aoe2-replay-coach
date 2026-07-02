@@ -75,20 +75,44 @@ upserted, final `collection.count()`). If ChromaDB is unreachable you get a clea
 ### Player attribution limitation (important)
 
 In the legacy Voobly action format these files use, only a subset of actions
-carry a player id: **BUILD, WALL, GATE, TRIBUTE, RESIGN, FLARE, DELETE** are
-player-attributed. **QUEUE, MULTIQUEUE, STANCE, TOWN_BELL, BACK_TO_WORK, REPAIR,
-UNGARRISON, BUY, SELL** are **not** — they identify the player only via the
-producing/selected object, whose owner is not recoverable from the command
-stream (verified: QUEUE object ids never appear among player-attributed object
-ids, so an ownership map does not resolve them).
+carry a player id directly in their payload: **BUILD, WALL, GATE, TRIBUTE,
+RESIGN, FLARE, DELETE** are player-attributed. **QUEUE, MULTIQUEUE, STANCE,
+TOWN_BELL, BACK_TO_WORK, REPAIR, UNGARRISON, BUY, SELL** are **not** — they
+identify the player only via the producing/selected object, whose owner is not
+carried in that same action.
 
-Rather than guess, such events are bucketed under a sentinel player id
+**Ownership ledger (partial recovery).** QUEUE/MULTIQUEUE identify their
+producing building(s) via `object_ids` even without a player id. Separately,
+ORDER, MOVE, FORMATION, WALL, and DELETE actions carry BOTH a real `player_id`
+*and* `object_ids` — so whenever one of those targets an object, that is
+provable evidence the object belongs to that player. `replay_parser.py` builds
+an in-memory ledger (`object_id -> player_id`) from every such action during
+the body walk (ORDER/MOVE/FORMATION are decoded for this purpose only — they
+are never added to the event timeline itself), then does a post-walk pass:
+any QUEUE/MULTIQUEUE event whose producing building(s) **all** resolve to the
+**same single player** in the ledger is attributed to that player, with
+`extras["attributed_via"] = "ownership_ledger"` marking it as inferred (as
+opposed to a real payload `player_id`). If the same object id is ever claimed
+by two different players, we never guess — that object id is dropped from the
+ledger entirely and counted (`ownership.conflicts` in the returned dict; seen
+rarely, e.g. 6 out of ~3100 claims on one 4v4 file, likely object-id reuse or a
+shared `target_id` bleeding into `object_ids` for some action variant).
+
+This recovers a real but partial slice of QUEUE attribution — observed
+coverage is roughly **7–21% of QUEUE/MULTIQUEUE events** across sampled
+multiplayer files (a building that is only ever queued from, and never
+otherwise ORDER/MOVE/FORMATION/WALL/DELETE-targeted, simply never enters the
+ledger). Un-resolved events keep the honest sentinel
 (`UNATTRIBUTED_PLAYER_ID = -1`, rendered `p=?`, metadata `player_name:
-"Unattributed"`). This is honest but consequential: **per-player QUEUE-based
-signals (boom villager curve, army composition) are not directly attributable in
-v1**. The reliable per-player spine is the BUILD-attributed signals — which is
-why the two reference signals (`build_by_category`, `town_center_timing`) are
-built on BUILD. **This needs a supervisor decision** — see "Open question" below.
+"Unattributed"`). Known unhandled edge case: a building captured mid-match via
+Monk conversion changes owner, but v1 ledger semantics are whole-match
+(first-claim-wins, no per-timestamp resolution) — a captured building's later
+QUEUE events could still resolve to the original owner if the new owner never
+issues a claim-generating action against it first. The reliable per-player
+spine remains the directly BUILD-attributed signals — which is why the two
+reference signals (`build_by_category`, `town_center_timing`) are built on
+BUILD, with the ledger as a supplementary, best-effort signal for QUEUE-based
+analysis.
 
 ### Player names — `resolve_players()` reliability
 
@@ -161,6 +185,14 @@ per-player spine for v1 and treat QUEUE as match-level aggregate; (b) investigat
 whether forcing mgz's DE/71094 action path (which *does* attribute every action)
 applies to this Voobly build; (c) reconstruct ownership via a fuller game-state
 walk. Needs your call.
+
+**Update:** a lightweight version of (c) — the ownership ledger described above
+— is now implemented and only ever attributes what is provable (conflicting
+claims are discarded, never guessed). It recovers roughly 7–21% of
+QUEUE/MULTIQUEUE events on sampled multiplayer files; the remainder still falls
+back to the sentinel. This is a floor, not a replacement for (a)/(b) — still
+your call whether it's enough to lean on QUEUE-based signals more heavily, or
+whether (b) is worth pursuing for fuller coverage.
 
 ---
 

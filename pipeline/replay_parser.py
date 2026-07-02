@@ -52,8 +52,10 @@ _POSTGAME_ACTION_ID = 255
 _BODY_PREAMBLE_BYTES = 24
 
 # Actions that carry a meaningful player intent we want in the timeline.
-# (MOVE/ORDER/etc. are intentionally excluded from v1 — they are high-volume and
-# the reference signals do not yet use them. They remain easy to add later.)
+# (MOVE/ORDER/FORMATION are intentionally excluded from the *timeline* — they are
+# high-volume and the reference signals do not yet use them. They are still
+# decoded — see _OWNERSHIP_CLAIM_ACTIONS below — purely to feed the ownership
+# ledger used to attribute QUEUE/MULTIQUEUE events; they never become events.)
 _TIMELINE_ACTIONS = {
     Action.BUILD,
     Action.WALL,
@@ -72,6 +74,21 @@ _TIMELINE_ACTIONS = {
     Action.UNGARRISON,
     Action.SELL,
     Action.BUY,
+}
+
+# Actions whose payload can carry BOTH a real player_id and a non-empty
+# object_ids list — i.e. actions that can prove "this object belongs to this
+# player" (see the ownership ledger in _build_ownership_ledger). ORDER/MOVE/
+# FORMATION are decoded *only* for this purpose (they are not in
+# _TIMELINE_ACTIONS). WALL and DELETE are already decoded for the timeline, so
+# their already-parsed payloads are reused for claims too, at no extra parse
+# cost.
+_OWNERSHIP_CLAIM_ACTIONS = {
+    Action.ORDER,
+    Action.MOVE,
+    Action.FORMATION,
+    Action.WALL,
+    Action.DELETE,
 }
 
 
@@ -361,6 +378,9 @@ def parse_match_timeline(path: str) -> dict:
         players           dict  {pid: name} (best effort)
         events            list  [{t_ms, t_str, player_id, action, obj_id,
                                   obj_name, category, extras}]
+        ownership         dict  {claims, conflicts, queue_attributed,
+                                  queue_total} — see _build_ownership_ledger
+                                  and _attribute_queue_events.
 
     Raises
     ------
@@ -387,6 +407,13 @@ def parse_match_timeline(path: str) -> dict:
     events: list[dict] = []
     postgame_duration: int | None = None
     postgame_complete = False
+    # Ownership ledger: object_id -> player_id, built from every action whose
+    # payload proves "this player controls this object" (ORDER/MOVE/FORMATION/
+    # WALL/DELETE). Used after the walk to attribute QUEUE/MULTIQUEUE events to
+    # the player who provably controls the producing building. See
+    # _record_ownership_claims and _attribute_queue_events.
+    ledger: dict[int, int] = {}
+    ledger_conflicts = 0
     # Number of body operations decoded without error. A replay is "readable" if
     # we walked a meaningful run of its op stream — even if it yielded zero
     # *timeline* events (a very short game may contain only MOVE/ORDER ops, which
@@ -424,7 +451,8 @@ def parse_match_timeline(path: str) -> dict:
                 data.read(12)
 
             elif op == Operation.ACTION:
-                pg = _handle_action(data, total_ms, events)
+                pg, conflict = _handle_action(data, total_ms, events, ledger)
+                ledger_conflicts += conflict
                 if pg is not None:
                     postgame_duration, postgame_complete = pg
                     break  # POSTGAME is the last meaningful op
@@ -467,6 +495,8 @@ def parse_match_timeline(path: str) -> dict:
 
     duration_ms = postgame_duration if postgame_duration else total_ms
 
+    queue_attributed, queue_total = _attribute_queue_events(events, ledger)
+
     return {
         "match_id": match_id,
         "date": date_from_path(path),
@@ -476,16 +506,29 @@ def parse_match_timeline(path: str) -> dict:
         "players": resolve_players(raw),
         "player_civs": resolve_player_civs(raw),
         "events": events,
+        "ownership": {
+            "claims": len(ledger),
+            "conflicts": ledger_conflicts,
+            "queue_attributed": queue_attributed,
+            "queue_total": queue_total,
+        },
     }
 
 
 def _handle_action(
-    data: io.BytesIO, total_ms: int, events: list[dict]
-) -> tuple[int, bool] | None:
+    data: io.BytesIO, total_ms: int, events: list[dict], ledger: dict[int, int]
+) -> tuple[tuple[int, bool] | None, int]:
     """Read one ACTION op, append an event if relevant, return POSTGAME info.
 
-    Returns ``(duration_ms, complete)`` when the action is POSTGAME (signalling
-    the caller to stop), otherwise ``None``.
+    Also feeds the ownership ``ledger`` (``object_id -> player_id``) from any
+    action that proves ownership (see ``_OWNERSHIP_CLAIM_ACTIONS``), whether or
+    not that action type is also a timeline event.
+
+    Returns ``(postgame_info, conflict_count)``, where ``postgame_info`` is
+    ``(duration_ms, complete)`` when the action is POSTGAME (signalling the
+    caller to stop) or ``None`` otherwise, and ``conflict_count`` is ``1`` if
+    this action caused an existing ledger entry to be discarded due to a
+    conflicting claim (0 otherwise; see ``_record_ownership_claims``).
     """
     length, = struct.unpack("<I", data.read(4))
     action_id = data.read(1)[0]
@@ -494,27 +537,35 @@ def _handle_action(
 
     # Skip the Voobly heartbeat before it ever reaches the Action enum.
     if action_id == _HEARTBEAT_ACTION_ID:
-        return None
+        return None, 0
 
     if action_id == _POSTGAME_ACTION_ID:
-        return _parse_postgame(action_bytes + data.read())
+        return _parse_postgame(action_bytes + data.read()), 0
 
     try:
         action_type = Action(action_id)
     except ValueError:
         # Unknown but non-fatal action id; skip it.
-        return None
+        return None, 0
 
-    if action_type not in _TIMELINE_ACTIONS:
-        return None
+    is_timeline = action_type in _TIMELINE_ACTIONS
+    is_claim = action_type in _OWNERSHIP_CLAIM_ACTIONS
+    if not is_timeline and not is_claim:
+        return None, 0
 
     try:
         payload = parse_action(action_type, action_bytes)
     except struct.error:
-        return None
+        return None, 0
 
-    _append_event(events, action_type, payload, total_ms)
-    return None
+    conflict = 0
+    if is_claim:
+        conflict = _record_ownership_claims(ledger, payload)
+
+    if is_timeline:
+        _append_event(events, action_type, payload, total_ms)
+
+    return None, conflict
 
 
 def _parse_postgame(payload_bytes: bytes) -> tuple[int, bool]:
@@ -603,6 +654,13 @@ def _append_event(
             obj_name, category = dat_ids.get_obj(obj_id)
         if payload.get("amount"):
             extras["amount"] = payload["amount"]
+        # The producing building(s) — no player_id is carried by QUEUE/
+        # MULTIQUEUE itself, so this is the only lead we have towards
+        # attribution. Captured here and consumed by _attribute_queue_events
+        # after the full body walk (once the ownership ledger is complete).
+        building_ids = payload.get("object_ids")
+        if building_ids:
+            extras["building_ids"] = list(building_ids)
 
     elif action_type in (Action.TRIBUTE, Action.DE_TRIBUTE):
         extras["to"] = payload.get("player_id_to")
@@ -643,3 +701,114 @@ def _append_event(
             "extras": extras,
         }
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ownership ledger — attributing QUEUE/MULTIQUEUE via provable building control
+# ─────────────────────────────────────────────────────────────────────────────
+# QUEUE/MULTIQUEUE (unit production) actions carry no player_id in this legacy
+# Voobly action format — only the id(s) of the producing building. But other
+# action types (ORDER, MOVE, FORMATION, WALL, DELETE) *do* carry both a real
+# player_id and the object_ids being acted on. Whenever one of those actions
+# targets an object we have not seen before, that is provable evidence that the
+# object belongs to that player — we call this a "claim". After the full body
+# walk, any QUEUE/MULTIQUEUE event whose producing building(s) all resolve, in
+# the ledger, to one single player is attributed to that player.
+#
+# This is deliberately conservative:
+#   * A claim is only ever recorded from a payload that has BOTH a real
+#     player_id and a non-empty object_ids list (see _OWNERSHIP_CLAIM_ACTIONS).
+#   * If the SAME object_id is ever claimed by two DIFFERENT player_ids, we do
+#     not guess which one is right — we drop that object_id from the ledger
+#     entirely (see the conflict branch below) and count the conflict for
+#     observability. In practice this should be rare-to-never: it would need
+#     object-id reuse after a building/unit is destroyed and a different
+#     player's object happens to be assigned the same id later in the same
+#     match. Nothing currently detects object destruction/reuse explicitly, so
+#     this discard-on-conflict rule is the safety net for that edge case.
+#   * Coverage is inherently partial: a building that is only ever queued from
+#     and never otherwise touched by ORDER/MOVE/FORMATION/WALL/DELETE in the
+#     whole match will simply never appear in the ledger, and its QUEUE events
+#     stay under the UNATTRIBUTED_PLAYER_ID sentinel. That is intentional —
+#     the design goal is "attribute what is provable", not "attribute
+#     everything".
+#   * A rare unhandled edge case: a building captured via Monk conversion
+#     changes owner mid-match. Since v1 ledger semantics are whole-match (first
+#     claim wins, no per-timestamp resolution), a captured building's later
+#     QUEUE events would still be attributed to whichever player first claimed
+#     it — which could be the *original* owner, not the new one, if the new
+#     owner never issues an ORDER/MOVE/FORMATION/WALL/DELETE against it before
+#     the corresponding QUEUE event. This is a known, accepted gap; the
+#     alternative (tracking per-timestamp ownership) is out of scope for v1.
+def _record_ownership_claims(ledger: dict[int, int], payload: dict) -> int:
+    """Record ``object_id -> player_id`` claims from one action's payload.
+
+    Only acts when the payload has both a real ``player_id`` and a non-empty
+    ``object_ids`` list. Returns ``1`` if this call caused a conflicting
+    object_id to be discarded from the ledger, ``0`` otherwise.
+    """
+    player_id = payload.get("player_id")
+    object_ids = payload.get("object_ids")
+    if player_id is None or not object_ids:
+        return 0
+
+    conflict = 0
+    for obj_id in object_ids:
+        existing = ledger.get(obj_id)
+        if existing is None:
+            ledger[obj_id] = player_id
+        elif existing != player_id:
+            # Conflicting claims for the same object_id: never guess. Remove it
+            # entirely so no QUEUE event can be (mis-)attributed via it.
+            del ledger[obj_id]
+            conflict += 1
+    return conflict
+
+
+def _attribute_queue_events(
+    events: list[dict], ledger: dict[int, int]
+) -> tuple[int, int]:
+    """Post-walk attribution pass for QUEUE/MULTIQUEUE events.
+
+    For every still-unattributed QUEUE/MULTIQUEUE event whose captured
+    ``extras["building_ids"]`` all resolve, in ``ledger``, to the same single
+    player, set that event's ``player_id`` to that player and mark
+    ``extras["attributed_via"] = "ownership_ledger"`` so downstream consumers
+    can tell a ledger-derived attribution apart from a genuine payload
+    ``player_id``. Events with no building_ids, building_ids not present in
+    the ledger, or building_ids owned by more than one player are left
+    untouched (sentinel stays).
+
+    Returns
+    -------
+    ``(queue_attributed, queue_total)`` — counts across all QUEUE/MULTIQUEUE
+    events in ``events`` (attributed here or already attributed some other
+    way, out of the total), for the caller's ``ownership`` summary.
+    """
+    queue_total = 0
+    queue_attributed = 0
+    for event in events:
+        if event["action"] not in ("QUEUE", "MULTIQUEUE"):
+            continue
+        queue_total += 1
+
+        if event["player_id"] != UNATTRIBUTED_PLAYER_ID:
+            queue_attributed += 1
+            continue
+
+        building_ids = event["extras"].get("building_ids")
+        if not building_ids:
+            continue
+
+        # Require EVERY building_id to resolve in the ledger (not just some),
+        # and all of them to resolve to the SAME player.
+        if not all(bid in ledger for bid in building_ids):
+            continue
+        owners = {ledger[bid] for bid in building_ids}
+        if len(owners) == 1:
+            (owner,) = owners
+            event["player_id"] = owner
+            event["extras"]["attributed_via"] = "ownership_ledger"
+            queue_attributed += 1
+
+    return queue_attributed, queue_total
