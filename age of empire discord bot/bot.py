@@ -45,7 +45,9 @@ WAKE_WORDS = [
     for w in os.getenv("VOICE_WAKE_WORD", "teletron,electron,telethon").split(",")
     if w.strip()
 ]
-REPLY_MAX_TOKENS    = int(os.getenv("VOICE_REPLY_MAX_TOKENS", "300"))
+REPLY_MAX_TOKENS    = int(os.getenv("VOICE_REPLY_MAX_TOKENS", "200"))
+# TTS playback speed multiplier (ffmpeg atempo: pitch-preserving, 0.5–2.0).
+VOICE_TTS_SPEED     = float(os.getenv("VOICE_TTS_SPEED", "1.25"))
 
 # Maps Discord display names to Voobly usernames for profile lookup.
 # Edit this dict to add new players. Key = Discord display name, Value = Voobly username.
@@ -1547,6 +1549,22 @@ async def random_civ(ctx: commands.Context, role: str = "any"):
 # ECO & TRAINING COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Standing style rules appended to every LLM answer prompt (text and voice).
+# Answers may be read aloud by TTS, so markdown must never appear — gTTS reads
+# "**Player6**" as "asterisk asterisk Player6".
+ANSWER_STYLE_GUIDELINES = (
+    "\n\nStyle rules for every answer:"
+    "\n- Refer to players by the short natural form of their username: strip "
+    "trailing digits and tags, use normal capitalisation (Player6 -> "
+    "Player6, Player2 -> Player2, Player8 -> Player8, SalarWaleed -> Salar, "
+    "Player3 -> Player3, Player5 -> Player5)."
+    "\n- Plain conversational text ONLY: no asterisks, no markdown bold, no "
+    "bullet symbols, no headers, no emoji. The answer may be spoken aloud by "
+    "text-to-speech exactly as written."
+    "\n- Be brief and direct: a few short sentences unless the question "
+    "genuinely needs numbered steps."
+)
+
 ECO_SYSTEM_PROMPT = (
     "You are an expert Age of Empires II economy coach for a custom Voobly "
     "v1.6 ruleset used on this server — NOT vanilla Age of Conquerors. In "
@@ -1563,11 +1581,11 @@ ECO_SYSTEM_PROMPT = (
     "(gather rates, building/unit costs, resource math) to reason about "
     "THIS specific high-resource, multi-TC ruleset. Give concise, "
     "actionable advice on villager allocation across multiple TCs, "
-    "resource splits, booming pace, and eco recovery. Use short "
-    "paragraphs or bullet points. Keep answers tight enough to fit in a "
-    "Discord embed — a few hundred words at most. Do not pad with "
-    "disclaimers."
-) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
+    "resource splits, booming pace, and eco recovery. Keep answers tight "
+    "enough to fit in a Discord embed — a few hundred words at most. Do "
+    "not pad with disclaimers."
+) + ANSWER_STYLE_GUIDELINES \
+  + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
   + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
 
 GG_SYSTEM_PROMPT = (
@@ -1581,9 +1599,10 @@ GG_SYSTEM_PROMPT = (
     "those profiles and say so plainly if a player has no profile or the data "
     "doesn't cover what was asked — never invent stats. For general strategy "
     "questions, apply your AoE2 knowledge grounded in the server ruleset and "
-    "game rates provided. Keep answers tight (a few hundred words max). Use "
-    "bullet points where it helps. Do not pad with disclaimers."
-) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
+    "game rates provided. Keep answers tight (a few hundred words max). "
+    "Do not pad with disclaimers."
+) + ANSWER_STYLE_GUIDELINES \
+  + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
   + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
 
 
@@ -1793,9 +1812,10 @@ BUILD_SYSTEM_PROMPT = (
     "multi-TC ruleset. Include villager allocation, approximate timings, "
     "and a short note on attack angle, how it's countered, and best civs "
     "for it when relevant. Keep the answer tight enough for a Discord "
-    "embed — a few hundred words at most. Use bullet points or numbered "
-    "steps."
-) + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
+    "embed — a few hundred words at most. Use plain numbered steps where "
+    "a sequence is needed."
+) + ANSWER_STYLE_GUIDELINES \
+  + (("\n\n## Server Reference Data\n" + reference_loader.VOOBLY_V16) if reference_loader.VOOBLY_V16 else "") \
   + (("\n\n## Game Rates Reference\n" + reference_loader.GAME_RATES) if reference_loader.GAME_RATES else "")
 
 
@@ -1892,12 +1912,24 @@ trainer_sessions: dict[int, dict] = {}
 TRAINER_AUTO_ADVANCE_DELAY = 0  # 0 = manual (!next only), set to seconds for auto
 
 
+def _tts_sanitize(text: str) -> str:
+    """Strip markdown/formatting characters before TTS — gTTS reads them
+    literally ("**Player6**" becomes "asterisk asterisk Player6")."""
+    import re as _re
+    cleaned = _re.sub(r"[*_`#>|~•]", "", text)
+    return _re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
 async def _speak_step(voice_client: discord.VoiceClient, text: str, guild_id: int):
     """Generate TTS audio for `text` and play it in the voice channel."""
     try:
         from gtts import gTTS
     except ImportError:
         return False  # gTTS not installed
+
+    text = _tts_sanitize(text)
+    if not text:
+        return False
 
     # Write to a temp file
     tmp = pathlib.Path(tempfile.mktemp(suffix=".mp3"))
@@ -1913,7 +1945,12 @@ async def _speak_step(voice_client: discord.VoiceClient, text: str, guild_id: in
         tmp.unlink(missing_ok=True)
         bot.loop.call_soon_threadsafe(finished.set)
 
-    voice_client.play(discord.FFmpegPCMAudio(str(tmp)), after=after)
+    # atempo speeds playback without chipmunk pitch (clamped to ffmpeg's range).
+    speed = max(0.5, min(2.0, VOICE_TTS_SPEED))
+    ffmpeg_opts = f'-filter:a "atempo={speed}"' if speed != 1.0 else None
+    voice_client.play(
+        discord.FFmpegPCMAudio(str(tmp), options=ffmpeg_opts), after=after
+    )
     try:
         # Cap the wait: if the voice connection drops mid-playback the `after`
         # callback may never fire, and an uncapped wait would hang forever.
