@@ -220,7 +220,7 @@ def match_wake_word(transcript: str, wake: str = "teletron") -> str | None:
         r'^(?:.*?\b)?'          # anything before (non-greedy, optional word boundary)
         r'(' + spaced_wake + r')'   # wake word (flexible spacing)
         r'(?:\s+(?:1|one))?'    # optional '1'/'one' immediately after wake word
-        r'[,\.\s]*'             # optional filler punctuation/whitespace
+        r'[,\.!\?\s]*'          # optional filler punctuation/whitespace
         r'(.*?)$'               # captured remainder (query)
     )
     m = re.search(pattern, text, re.IGNORECASE)
@@ -231,6 +231,26 @@ def match_wake_word(transcript: str, wake: str = "teletron") -> str | None:
     # Strip a leading '1'/'one,' that slipped through (belt-and-suspenders)
     query = re.sub(r'^(?:1|one)[,\.\s]*', '', query, flags=re.IGNORECASE).strip()
     return query
+
+
+# Fallback for Discord VAD onset clipping: the mic often starts transmitting
+# mid-word, so "Teletron, who…" arrives transcribed as "ron, who…" or
+# "tron, who…". Anchored to the START of the utterance only, and requires a
+# non-empty remainder, to keep false positives (e.g. "Ronaldo") out.
+_CLIPPED_ONSET = re.compile(
+    r'^(?:te?le?t?|t)?ron\b[,\.!\?\s]*(.+)$', re.IGNORECASE
+)
+
+
+def match_clipped_wake(transcript: str) -> str | None:
+    """Wake fallback for onset-clipped audio ('ron …' / 'tron …' / 'teleron …').
+
+    Returns the query after the clipped wake fragment, or None. Only matches
+    at the very start of the utterance and never with an empty remainder.
+    """
+    text = re.sub(r'\s+', ' ', transcript.strip().lower())
+    m = _CLIPPED_ONSET.match(text)
+    return m.group(1).strip() if m else None
 
 
 # ── WakeSink ─────────────────────────────────────────────────────────────────

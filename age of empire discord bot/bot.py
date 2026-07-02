@@ -42,12 +42,20 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # speech-to-text actually mishears "Teletron" (observed live: "Electron one…").
 WAKE_WORDS = [
     w.strip().lower()
-    for w in os.getenv("VOICE_WAKE_WORD", "teletron,electron,telethon").split(",")
+    for w in os.getenv(
+        "VOICE_WAKE_WORD", "teletron,electron,telethon,teleron"
+    ).split(",")
     if w.strip()
 ]
 REPLY_MAX_TOKENS    = int(os.getenv("VOICE_REPLY_MAX_TOKENS", "200"))
 # TTS playback speed multiplier (ffmpeg atempo: pitch-preserving, 0.5–2.0).
 VOICE_TTS_SPEED     = float(os.getenv("VOICE_TTS_SPEED", "1.25"))
+# Utterance segmentation: how long a pause ends an utterance, and the minimum
+# utterance length worth transcribing. 0.8s gap proved too aggressive live —
+# natural mid-sentence pauses split "Teletron … who is…" into fragments that
+# individually fail the wake check.
+VOICE_SILENCE_GAP   = float(os.getenv("VOICE_SILENCE_GAP_SEC", "1.2"))
+VOICE_MIN_UTTERANCE = float(os.getenv("VOICE_MIN_UTTERANCE_SEC", "0.5"))
 
 # Maps Discord display names to Voobly usernames for profile lookup.
 # Edit this dict to add new players. Key = Discord display name, Value = Voobly username.
@@ -2655,7 +2663,12 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
             if query is not None:
                 break
         if query is None:
+            # Onset-clipping fallback: Discord VAD often cuts the first
+            # phonemes, so "Teletron, who…" arrives as "ron, who…".
+            query = voice_listen.match_clipped_wake(text)
+        if query is None:
             return  # not addressed to the bot
+        print(f"[listen] wake matched: {query!r}")
 
         if query == "":
             # Just the wake word — prompt for a question
@@ -2706,7 +2719,12 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
             print(f"[listen] speak error: {exc}")
 
     # Build and start the sink
-    sink = voice_listen.WakeSink(loop, on_utterance)
+    sink = voice_listen.WakeSink(
+        loop,
+        on_utterance,
+        min_sec=VOICE_MIN_UTTERANCE,
+        silence_gap=VOICE_SILENCE_GAP,
+    )
     vc.listen(sink)
 
     trainer_sessions[guild_id] = {"vc": vc, "listen": True, "sink": sink}
