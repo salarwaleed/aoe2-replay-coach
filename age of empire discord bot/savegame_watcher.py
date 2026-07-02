@@ -65,13 +65,21 @@ def _ensure_pipeline_importable() -> None:
 _ensure_pipeline_importable()
 
 
+# Sentinel: the sweep failed because a pipeline dependency (e.g. chromadb) is
+# not installed in THIS Python environment. Unlike a transient outage this can
+# never succeed on retry, so the loop disables itself instead of failing every
+# cycle forever (which buried real errors in noise).
+_MISSING_DEP = -99
+
+
 def run_ingest_sweep() -> int:
     """Run one Pipeline 1 ingestion sweep synchronously.
 
-    Returns Pipeline 1's exit code (0 on success). Never raises — any error,
-    including the SystemExit pipeline1_ingest raises when ChromaDB is
-    unreachable, is caught and logged so a transient outage just skips this
-    cycle instead of taking the bot down.
+    Returns Pipeline 1's exit code (0 on success), or _MISSING_DEP when the
+    failure is an uninstalled dependency. Never raises — any error, including
+    the SystemExit pipeline1_ingest raises when ChromaDB is unreachable, is
+    caught and logged so a transient outage just skips this cycle instead of
+    taking the bot down.
     """
     try:
         from pipeline.pipeline1_ingest import main as ingest_main
@@ -79,6 +87,8 @@ def run_ingest_sweep() -> int:
         return ingest_main()
     except BaseException as exc:  # noqa: BLE001 - intentional: see module docstring
         print(f"[savegame_watcher] ingestion sweep failed: {type(exc).__name__}: {exc}")
+        if "not installed" in str(exc):
+            return _MISSING_DEP
         return 1
 
 
@@ -94,6 +104,16 @@ async def _savegame_watch_loop() -> None:
 
     loop = asyncio.get_running_loop()
     code = await loop.run_in_executor(None, run_ingest_sweep)
+    if code == _MISSING_DEP:
+        print(
+            "[savegame_watcher] disabled for this run: pipeline dependencies "
+            "are not installed in the bot's Python. To enable in-bot "
+            "ingestion, run:  pip install -r pipeline/requirements.txt  "
+            "(with the bot's Python). Replays can still be ingested by "
+            "running Pipeline 1 in its venv."
+        )
+        _savegame_watch_loop.stop()
+        return
     status = "ok" if code == 0 else f"exit code {code}"
     print(f"[savegame_watcher] sweep complete ({status}).")
 

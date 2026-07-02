@@ -2499,8 +2499,10 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
 
     # ── STOP ────────────────────────────────────────────────────────────────
     if mode == "stop":
-        session = trainer_sessions.get(guild_id)
-        if session and session.get("listen"):
+        stopped = False
+
+        session = trainer_sessions.pop(guild_id, None)
+        if session:
             sink = session.get("sink")
             if sink:
                 try:
@@ -2509,11 +2511,31 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
                     pass
             vc = session.get("vc")
             if vc and vc.is_connected():
-                await vc.disconnect()
-            trainer_sessions.pop(guild_id, None)
-            await ctx.send("Stopped listening.")
-        else:
-            await ctx.send("No active listen session for this server.")
+                await vc.disconnect(force=True)
+                stopped = True
+
+        # Also clear any untracked/ghost voice connection: trainer_sessions is
+        # in-memory, so after a bot restart it's empty even though Discord may
+        # still show this bot connected (leftover from the killed process).
+        # Previously "!listen stop" reported nothing to stop while the bot
+        # visibly sat in the channel.
+        leftover = ctx.guild.voice_client
+        if leftover is not None:
+            try:
+                if hasattr(leftover, "stop_listening"):
+                    leftover.stop_listening()
+            except Exception:
+                pass
+            try:
+                await leftover.disconnect(force=True)
+                stopped = True
+            except Exception:
+                pass
+
+        await ctx.send(
+            "Stopped listening." if stopped
+            else "Not connected to voice — nothing to stop."
+        )
         return
 
     # ── START ────────────────────────────────────────────────────────────────
@@ -2536,6 +2558,21 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
         if old_vc and old_vc.is_connected():
             await old_vc.disconnect()
         trainer_sessions.pop(guild_id, None)
+
+    # Clear any untracked/ghost voice connection left over from a previous
+    # process — channel.connect() raises ClientException if a stale voice
+    # client is still registered for this guild.
+    leftover = ctx.guild.voice_client
+    if leftover is not None:
+        try:
+            if hasattr(leftover, "stop_listening"):
+                leftover.stop_listening()
+        except Exception:
+            pass
+        try:
+            await leftover.disconnect(force=True)
+        except Exception:
+            pass
 
     # Connect with voice-recv client
     vc = await channel.connect(cls=_voice_recv.VoiceRecvClient)
