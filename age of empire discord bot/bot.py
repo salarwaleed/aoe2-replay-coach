@@ -38,7 +38,13 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # ── Voice listener config ─────────────────────────────────────────────────────
-WAKE_WORD           = os.getenv("VOICE_WAKE_WORD", "teletron")
+# Comma-separated accepted wake words. The extra variants cover how the
+# speech-to-text actually mishears "Teletron" (observed live: "Electron one…").
+WAKE_WORDS = [
+    w.strip().lower()
+    for w in os.getenv("VOICE_WAKE_WORD", "teletron,electron,telethon").split(",")
+    if w.strip()
+]
 REPLY_MAX_TOKENS    = int(os.getenv("VOICE_REPLY_MAX_TOKENS", "300"))
 
 # Maps Discord display names to Voobly usernames for profile lookup.
@@ -1908,7 +1914,12 @@ async def _speak_step(voice_client: discord.VoiceClient, text: str, guild_id: in
         bot.loop.call_soon_threadsafe(finished.set)
 
     voice_client.play(discord.FFmpegPCMAudio(str(tmp)), after=after)
-    await finished.wait()
+    try:
+        # Cap the wait: if the voice connection drops mid-playback the `after`
+        # callback may never fire, and an uncapped wait would hang forever.
+        await asyncio.wait_for(finished.wait(), timeout=180)
+    except (asyncio.TimeoutError, TimeoutError):
+        pass
     return True
 
 
@@ -2296,16 +2307,18 @@ async def gg(ctx: commands.Context, *, question: str = None):
         )
         return
 
-    profiles_ctx = _build_all_profiles_context()
-    prompt = f"Question: {question}"
-    if profiles_ctx:
-        prompt += f"\n\n<player_profiles>\n{profiles_ctx}\n</player_profiles>"
+    # Context building hits MinIO (boto3) — keep it off the event loop
+    # together with the LLM call, so a slow/dead storage endpoint can't
+    # freeze the bot (same fix as the voice listener's answer path).
+    def _grounded_gg() -> str:
+        prompt = f"Question: {question}"
+        profiles_ctx = _build_all_profiles_context()
+        if profiles_ctx:
+            prompt += f"\n\n<player_profiles>\n{profiles_ctx}\n</player_profiles>"
+        return cloud_llm.safe_ask(prompt, system=GG_SYSTEM_PROMPT, max_tokens=900)
 
     async with ctx.typing():
-        answer = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: cloud_llm.safe_ask(prompt, system=GG_SYSTEM_PROMPT, max_tokens=900),
-        )
+        answer = await asyncio.get_event_loop().run_in_executor(None, _grounded_gg)
 
     # Discord embed description hard limit is 4096 chars.
     if len(answer) > 4000:
@@ -2599,47 +2612,61 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
             return
 
         # ── NORMAL MODE: wake-word gating ────────────────────────────────────
-        query = voice_listen.match_wake_word(text, WAKE_WORD)
+        query = None
+        for wake in WAKE_WORDS:
+            query = voice_listen.match_wake_word(text, wake)
+            if query is not None:
+                break
         if query is None:
             return  # not addressed to the bot
 
         if query == "":
             # Just the wake word — prompt for a question
-            await _speak_step(vc, "Yes? Ask your question.", guild_id)
+            try:
+                await _speak_step(vc, "Yes? Ask your question.", guild_id)
+            except Exception as exc:
+                print(f"[listen] speak error: {exc}")
             return
 
-        # Build grounded prompt (same pattern as !gg)
-        profiles_ctx = _build_all_profiles_context()
-        prompt = f"Question: {query}"
-        if profiles_ctx:
-            prompt += f"\n\n<player_profiles>\n{profiles_ctx}\n</player_profiles>"
-
-        match_ctx = _build_match_context()
-        if match_ctx:
-            prompt += f"\n\n<match_context>\n{match_ctx}\n</match_context>"
+        # Build the grounded prompt + call the LLM entirely off the event
+        # loop. The profile fetches hit MinIO (boto3); with storage down they
+        # used to block the loop long enough to drop the voice websocket and
+        # silently kill the answer.
+        def _grounded_answer() -> str:
+            prompt = f"Question: {query}"
+            profiles_ctx = _build_all_profiles_context()
+            if profiles_ctx:
+                prompt += f"\n\n<player_profiles>\n{profiles_ctx}\n</player_profiles>"
+            match_ctx = _build_match_context()
+            if match_ctx:
+                prompt += f"\n\n<match_context>\n{match_ctx}\n</match_context>"
+            return cloud_llm.safe_ask(
+                prompt, system=GG_SYSTEM_PROMPT, max_tokens=REPLY_MAX_TOKENS
+            )
 
         try:
-            answer = await loop.run_in_executor(
-                None,
-                lambda: cloud_llm.safe_ask(
-                    prompt, system=GG_SYSTEM_PROMPT, max_tokens=REPLY_MAX_TOKENS
-                ),
-            )
+            answer = await loop.run_in_executor(None, _grounded_answer)
         except Exception as exc:
             print(f"[listen] LLM error: {exc}")
             return
 
-        # Speak the answer
-        await _speak_step(vc, answer, guild_id)
-
-        # Also post a text embed for reference
+        # Post the text embed FIRST — guarantees a visible answer even if
+        # voice playback fails (speaking is best-effort on top).
         short = answer[:2000] if len(answer) > 2000 else answer
         embed = discord.Embed(
             title=f"\U0001f3a4 {user.display_name}: {query[:150]}",
             description=short,
             color=C_GG,
         )
-        await ctx.send(embed=embed)
+        try:
+            await ctx.send(embed=embed)
+        except Exception as exc:
+            print(f"[listen] embed send error: {exc}")
+
+        try:
+            await _speak_step(vc, answer, guild_id)
+        except Exception as exc:
+            print(f"[listen] speak error: {exc}")
 
     # Build and start the sink
     sink = voice_listen.WakeSink(loop, on_utterance)
@@ -2655,7 +2682,7 @@ async def listen_cmd(ctx: commands.Context, *, mode: str = ""):
     else:
         await ctx.send(
             f"\U0001f399️ Listening in **{channel.name}**. "
-            f"Say “**{WAKE_WORD.title()}, <your question>**” to get an answer. "
+            f"Say “**{WAKE_WORDS[0].title()}, <your question>**” to get an answer. "
             "Use `!listen stop` to disconnect."
         )
 

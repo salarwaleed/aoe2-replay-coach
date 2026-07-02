@@ -43,7 +43,20 @@ def _client():
             "    pip install -r pipeline/requirements.txt"
         ) from exc
 
-    kwargs = {"region_name": AWS_REGION}
+    from botocore.config import Config
+
+    # Fail fast when the endpoint is down. Bot command handlers call these
+    # lookups synchronously; botocore's default timeouts/retries can block for
+    # a minute+ against a dead local MinIO — long enough to starve the bot's
+    # event loop (observed live: voice websocket dropped while a lookup hung).
+    kwargs = {
+        "region_name": AWS_REGION,
+        "config": Config(
+            connect_timeout=3,
+            read_timeout=10,
+            retries={"max_attempts": 1},
+        ),
+    }
     if S3_ENDPOINT_URL is not None:
         # Local dev: MinIO. Real creds are never used here — only against
         # real AWS, where S3_ENDPOINT_URL is unset and boto3 falls through to
