@@ -86,10 +86,32 @@ def _apply_dave_decrypt_patch() -> None:
     _MediaType = _davey.MediaType
     _orig_decode_packet = PacketDecoder._decode_packet
 
+    def _dave_drop(decoder, packet):
+        # Represent an undecryptable packet as a *lost* packet: Opus PLC/silence
+        # via decode(None, fec=False) — exactly how voice_recv itself handles a
+        # dropped packet (opus.py `_decode_packet`). This keeps the PacketRouter
+        # running instead of stopping on an OpusError from feeding it a still-
+        # encrypted or unencrypted blob (the router treats a decode raise as
+        # fatal and calls self.stop(), killing all further reception).
+        if decoder is not None:
+            try:
+                return packet, decoder.decode(None, fec=False)
+            except Exception:
+                pass
+        return packet, b""
+
     def _dave_decode_packet(self, packet):
-        """Patched _decode_packet: DAVE-decrypt before Opus decode."""
-        # Only intercept real packets (not FakePackets which have no audio)
+        """Patched _decode_packet: DAVE-decrypt before Opus decode.
+
+        If DAVE is active but we cannot produce plain Opus for this packet
+        (session still negotiating, sender SSRC not yet mapped, or a genuinely
+        unencrypted/transition frame that davey refuses), DROP the packet
+        (return silence) instead of letting the bad blob reach Opus — that would
+        raise OpusError and voice_recv would stop the whole reader.
+        """
+        # Real packets only; FakePackets (falsy) use the original fec/PLC path.
         if packet:
+            vc = None
             dave_session = None
             try:
                 vc = self.sink.voice_client
@@ -97,39 +119,37 @@ def _apply_dave_decrypt_patch() -> None:
                 if conn is not None:
                     dave_session = getattr(conn, "dave_session", None)
             except Exception:
-                pass  # belt-and-suspenders; never crash here
+                pass  # never crash in the decode hot path
 
-            if dave_session is not None and dave_session.ready:
+            if dave_session is not None:
+                # DAVE active → incoming audio is E2EE and MUST be decrypted.
+                if not getattr(dave_session, "ready", False):
+                    return _dave_drop(self._decoder, packet)  # still negotiating
+
                 user_id = None
                 try:
                     user_id = vc._ssrc_to_id.get(self.ssrc)
                 except Exception:
                     pass
+                if user_id is None:
+                    return _dave_drop(self._decoder, packet)  # ssrc unmapped (transient)
 
-                if user_id is not None:
-                    try:
-                        plain_opus = dave_session.decrypt(
-                            user_id, _MediaType.audio, packet.decrypted_data
-                        )
-                        packet.decrypted_data = plain_opus
-                        _dave_log.debug(
-                            "DAVE decrypt OK: ssrc=%s uid=%s len=%s→%s",
-                            self.ssrc, user_id,
-                            len(packet.decrypted_data), len(plain_opus),
-                        )
-                    except Exception as exc:
-                        # Decrypt failure: leave data as-is.  Opus will raise
-                        # OpusError which voice_recv handles gracefully.
-                        _dave_log.debug(
-                            "DAVE decrypt failed: ssrc=%s uid=%s err=%r",
-                            self.ssrc, user_id, exc,
-                        )
-                else:
-                    _dave_log.debug(
-                        "DAVE decrypt skipped: ssrc=%s not yet in ssrc_to_id",
-                        self.ssrc,
+                try:
+                    plain_opus = dave_session.decrypt(
+                        user_id, _MediaType.audio, packet.decrypted_data
                     )
-            # else: session not ready / not present → passthrough (unmodified)
+                except Exception as exc:
+                    _dave_log.debug(
+                        "DAVE drop (decrypt fail ssrc=%s uid=%s): %r",
+                        self.ssrc, user_id, exc,
+                    )
+                    return _dave_drop(self._decoder, packet)
+
+                packet.decrypted_data = plain_opus
+                _dave_log.debug(
+                    "DAVE OK ssrc=%s uid=%s len=%s", self.ssrc, user_id, len(plain_opus)
+                )
+            # else: dave_session is None → not E2EE → plain Opus, fall through.
 
         return _orig_decode_packet(self, packet)
 
