@@ -14,8 +14,8 @@
 | **Domain** | Game analytics · LLM application engineering · reverse-engineering |
 | **Core stack** | Python · discord.py · the `mgz` replay library · ChromaDB · Ollama (local LLM) · Gemini (cloud LLM) |
 | **Methodology** | AI-assisted, multi-agent development; empirical feasibility probing; iterative architecture |
-| **Status** | Advanced design + research phase. A hard reverse-engineering problem **solved**; full pipeline scoped and documented; implementation gated on a few decisions. |
-| **Signature win** | Cracked a replay-file format (`VER 9.F`) that the standard parser library could not read. |
+| **Status** | **Shipped and deployed.** The full pipeline runs end-to-end; the bot is containerized and runs 24/7 on a free cloud VM. Ongoing research continues on the hardest open sub-problem (per-player unit attribution). |
+| **Signature wins** | (1) Cracked a replay-file format (`VER 9.F`) the standard parser could not read. (2) Decrypted Discord's mandatory **end-to-end-encrypted voice** on the receive path to transcribe it — after the platform started rejecting non-E2EE clients outright. |
 
 ---
 
@@ -188,7 +188,61 @@ A few principles I demonstrated repeatedly, and now hold deliberately:
 
 ---
 
-## 7. What completing this prepares me to build
+## 7. The second act — from research to a shipped, deployed system
+
+The sections above were written at the end of the research phase. Then I built it.
+Three problems from the build stand out.
+
+### 7.1 Grounding: stopping the LLM from giving generic advice
+Once live Gemini answers replaced the hardcoded dictionaries, a subtle failure
+appeared: the model gave *textbook* Age of Empires II advice — Dark-Age villager
+counts, Feudal-Age timings — none of which exist on this server's custom
+Imperial-Age-start ruleset. The model knew vanilla AoE2 from its training data
+and had never heard of our meta. **Fix: retrieval-augmented grounding.** Every
+answer prompt now carries server-specific reference data — exact starting
+resources, building costs, production math — plus the asking context's player
+profiles. The model reasons *from our numbers*, not its priors. (`cloud_llm.py`,
+`reference_data/`, `reference_loader.py`.)
+
+### 7.2 The E2EE voice saga — the second format I had to crack
+I wanted the bot to *listen*: say "Teletron, how do I beat a knight rush?" in
+voice and get a spoken answer. The receive side broke in a way that took real
+debugging. First, `discord.py` can't natively receive voice at all — I added a
+community extension. Then every audio frame decoded to garbage ("corrupted
+stream"). I traced it, ruling out theories one by one, to **DAVE** — Discord's
+new MLS-based end-to-end encryption. As of March 2026 the platform *mandates* it
+and rejects clients that opt out with close code `4017`; I confirmed this by
+trying to disable DAVE and watching the connection get refused. So the bot
+*couldn't* avoid E2EE — it had to actually decrypt it. Because the bot is a full
+member of the encrypted voice group, it holds the session keys; I hooked the
+receive pipeline to decrypt each frame with the live DAVE session before Opus
+decode. Result: **330 of 333 frames decrypted cleanly** in live testing, the
+three undecryptable transition frames dropped instead of crashing the reader.
+The same instinct as the replay format — *drop a level, understand the real
+wire format, don't fight the abstraction.*
+
+### 7.3 Ownership inference — and choosing the honest number
+The format never records *which player* produced a given unit. I built a
+"proof ledger": the few command types that carry a player identity attribute
+ownership to the buildings they touch, and unit production from a proven building
+inherits that owner — with a hard rule that **any object with conflicting
+evidence is discarded, never guessed.** An early sample of three files suggested
+~18-22% of production was attributable, which was encouraging. Then I ran the
+analysis across the *full* corpus and it came back at **~9%** (lower on big team
+games). I reported the 9%. The temptation in a portfolio piece is to quote the
+flattering sample; the engineering value is in the correction — a coverage claim
+is only worth what the full data says, and saying so is the job. (`replay_parser.py`,
+`docs/OWNERSHIP_RESEARCH.md`.)
+
+### 7.4 Deployment
+The system splits cleanly along its own two tiers: the light, always-on **bot**
+is containerized (`Dockerfile`, `deploy/`) and runs 24/7 on a free cloud VM,
+while the heavy **local-LLM synthesis** stays on a workstation and pushes
+profiles up. The machine that trains the profiles can be asleep; the bot never is.
+
+---
+
+## 8. What completing this prepares me to build
 
 The skills exercised here transfer directly to:
 
@@ -206,7 +260,7 @@ The skills exercised here transfer directly to:
 
 ---
 
-## 8. Closing reflection
+## 9. Closing reflection
 
 The most valuable thing this project taught me isn't a library or an API — it's a **way of working**:
 start with an ambitious vision, pressure-test it against reality early and honestly, separate the
