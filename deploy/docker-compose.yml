@@ -1,0 +1,40 @@
+# Deployment stack for the Oracle Cloud VM (or any Docker host).
+#   bot   — the Discord bot, built from the repo Dockerfile
+#   minio — profile storage the bot reads (starts empty; populate later)
+#
+# Run from the repo root:  docker compose -f deploy/docker-compose.yml up -d --build
+# Secrets live in deploy/secrets.env (created on the host, never committed).
+
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./secrets.env
+    environment:
+      # Point the bot's profile storage at the minio service below.
+      S3_ENDPOINT_URL: "http://minio:9000"
+      S3_ACCESS_KEY_ID: "localadmin"
+      S3_SECRET_ACCESS_KEY: "localpassword123"
+      # The bot only ingests replays if chromadb is installed (it isn't in the
+      # image) — the savegame watcher disables itself gracefully. Synthesis
+      # stays on your PC; profiles are pushed up to minio separately.
+    depends_on:
+      - minio
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "localadmin"
+      MINIO_ROOT_PASSWORD: "localpassword123"
+    volumes:
+      - minio-data:/data
+    # No public ports needed — only the bot talks to it, over the compose
+    # network. (Add "9001:9001" here temporarily if you want the web console.)
+
+volumes:
+  minio-data:

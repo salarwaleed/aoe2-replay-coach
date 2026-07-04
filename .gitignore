@@ -35,3 +35,7 @@ scratchpad/
 
 # Friend's reference data (kept local, not part of this repo)
 bisar/
+
+# Deploy secrets (host-only, never commit)
+secrets.env
+**/secrets.env

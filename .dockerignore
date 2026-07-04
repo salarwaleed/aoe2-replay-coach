@@ -1,0 +1,24 @@
+# Keep the build context small and secret-free.
+.git/
+.venv/
+**/__pycache__/
+*.py[cod]
+*.log
+
+# Secrets — must NEVER enter the image (passed via env at runtime instead).
+**/.env
+discord token.txt
+*.key
+*.pem
+
+# Local data / infra state (not needed in the image).
+infra/chroma-data/
+infra/dynamo-data/
+infra/minio-data/
+**/chroma-data/
+**/dynamo-data/
+**/minio-data/
+scratchpad/
+bisar/
+docs/
+.claude/
