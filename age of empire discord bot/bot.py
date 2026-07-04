@@ -1748,7 +1748,7 @@ async def eco(ctx: commands.Context, *, query: str = None):
 @bot.command(name="match")
 async def match_session(ctx: commands.Context, *, args: str = ""):
     """
-    !match ally salar player3 enemy player2 player6  — set current match teams
+    !match ally me teammate enemy rival1 rival2  — set current match teams
     !match status                                — show current session
     !match reset                                 — clear session
     """
@@ -1782,7 +1782,7 @@ async def match_session(ctx: commands.Context, *, args: str = ""):
 
     if not new_session["ally"] and not new_session["enemy"]:
         await ctx.send(
-            "Usage: `!match ally salar player3 enemy player2 player6` | `!match status` | `!match reset`"
+            "Usage: `!match ally me teammate enemy rival1 rival2` | `!match status` | `!match reset`"
         )
         return
 
@@ -2336,7 +2336,7 @@ async def gg(ctx: commands.Context, *, question: str = None):
     Examples:
       !gg who is the most aggressive player?
       !gg how do I beat a knight rush?
-      !gg compare player2 and player6
+      !gg compare two players
     """
     if not question:
         await ctx.send(
