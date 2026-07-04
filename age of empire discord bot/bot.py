@@ -57,19 +57,13 @@ VOICE_TTS_SPEED     = float(os.getenv("VOICE_TTS_SPEED", "1.25"))
 VOICE_SILENCE_GAP   = float(os.getenv("VOICE_SILENCE_GAP_SEC", "1.2"))
 VOICE_MIN_UTTERANCE = float(os.getenv("VOICE_MIN_UTTERANCE_SEC", "0.5"))
 
-# Maps Discord display names to Voobly usernames for profile lookup.
-# Edit this dict to add new players. Key = Discord display name, Value = Voobly username.
+# Maps Discord display names to Voobly usernames for profile lookup, for cases
+# where a member's Discord handle differs from their in-game name. Populate with
+# your own server's members (example entry below); the bot falls back to the raw
+# display name when a mapping is absent, so this can start empty.
 DISCORD_TO_VOOBLY: dict[str, str] = {
-    "SalarWaleed": "SalarWaleed",
-    "Player2": "Player2",
-    "Player3": "Player3",
-    "Player4": "Player4",
-    "Player5": "Player5",
-    "Player6": "Player6",
-    "Player6": "Player6",
-    "Player7": "Player7",
-    "Player9": "Player9",
-    "Player8": "Player8",
+    # "DiscordName": "VooblyName",
+    "ExamplePlayer": "ExamplePlayer",
 }
 
 _match_session: dict[str, list[str]] = {"ally": [], "enemy": []}
@@ -1559,13 +1553,12 @@ async def random_civ(ctx: commands.Context, role: str = "any"):
 
 # Standing style rules appended to every LLM answer prompt (text and voice).
 # Answers may be read aloud by TTS, so markdown must never appear — gTTS reads
-# "**Player6**" as "asterisk asterisk Player6".
+# "**Name**" literally as "asterisk asterisk Name".
 ANSWER_STYLE_GUIDELINES = (
     "\n\nStyle rules for every answer:"
     "\n- Refer to players by the short natural form of their username: strip "
-    "trailing digits and tags, use normal capitalisation (Player6 -> "
-    "Player6, Player2 -> Player2, Player8 -> Player8, SalarWaleed -> Salar, "
-    "Player3 -> Player3, Player5 -> Player5)."
+    "trailing digits and tags and use normal capitalisation "
+    "(e.g. PlayerName_123 -> PlayerName, TopGun99 -> TopGun)."
     "\n- Plain conversational text ONLY: no asterisks, no markdown bold, no "
     "bullet symbols, no headers, no emoji. The answer may be spoken aloud by "
     "text-to-speech exactly as written."
@@ -1922,7 +1915,7 @@ TRAINER_AUTO_ADVANCE_DELAY = 0  # 0 = manual (!next only), set to seconds for au
 
 def _tts_sanitize(text: str) -> str:
     """Strip markdown/formatting characters before TTS — gTTS reads them
-    literally ("**Player6**" becomes "asterisk asterisk Player6")."""
+    literally ("**Name**" becomes "asterisk asterisk Name")."""
     import re as _re
     cleaned = _re.sub(r"[*_`#>|~•]", "", text)
     return _re.sub(r"[ \t]{2,}", " ", cleaned).strip()
