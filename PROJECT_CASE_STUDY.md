@@ -1,275 +1,102 @@
-# Age of Empires II Behavioral Profiling Engine — Project Case Study
+# Case Study — Teletron: a data-driven Age of Empires II coaching platform
 
-### From a hardcoded Discord bot to a two-tier-LLM game-analytics pipeline
-
-> **A portfolio narrative: what I set out to build, how the plan changed when it met reality,
-> the problems I hit, how I solved them, and what I learned doing it.**
+### From a hardcoded Discord bot to a deployed, two-tier LLM game-analytics system
 
 ---
 
-## At a glance
+## Overview
 
 | | |
 |---|---|
-| **Domain** | Game analytics · LLM application engineering · reverse-engineering |
-| **Core stack** | Python · discord.py · the `mgz` replay library · ChromaDB · Ollama (local LLM) · Gemini (cloud LLM) |
-| **Methodology** | AI-assisted, multi-agent development; empirical feasibility probing; iterative architecture |
-| **Status** | **Shipped and deployed.** The full pipeline runs end-to-end; the bot is containerized and runs 24/7 on a free cloud VM. Ongoing research continues on the hardest open sub-problem (per-player unit attribution). |
-| **Signature wins** | (1) Cracked a replay-file format (`VER 9.F`) the standard parser could not read. (2) Decrypted Discord's mandatory **end-to-end-encrypted voice** on the receive path to transcribe it — after the platform started rejecting non-E2EE clients outright. |
+| **Domain** | LLM application engineering · data pipelines · binary reverse-engineering · real-time voice |
+| **Core stack** | Python 3.13 · discord.py · Google Gemini · Ollama (local LLM) · ChromaDB · DynamoDB · MinIO/S3 · the `mgz` replay library · Docker |
+| **Scope** | A Discord bot that answers Age of Empires II strategy questions from real match data, holds spoken conversations in a voice channel, and builds evolving player profiles by parsing game replay files. |
+| **Status** | **Shipped and deployed.** The pipeline runs end-to-end; the bot is containerized and runs 24/7 on a free cloud VM; a unit-test suite runs in CI. |
+| **Signature results** | Parsed a replay format the standard library cannot read; decrypted Discord's mandatory end-to-end-encrypted voice in order to transcribe it; built a provable player-attribution mechanism with measured, reported coverage. |
 
 ---
 
-## 1. Where it started
+## 1. Problem and motivation
 
-The project began as a working but **fully hardcoded** Discord bot for *Age of Empires II*
-(Voobly v1.6 competitive mod): ~2,700 lines of Python with large static dictionaries powering
-commands like `!civ`, `!counter`, `!build`, and a replay-analysis feature (`!analyze`, `!profile`)
-that read saved games from disk.
+The project began as a functional but entirely hardcoded Discord bot for a competitive *Age of Empires II* community running a custom Voobly v1.6 ruleset — roughly 2,700 lines of Python whose "knowledge" lived in large static dictionaries. Every answer it gave was something a human had typed into a lookup table by hand.
 
-I started by deliberately separating **where** work should happen — planning, documentation, and
-coordination in a chat-style assistant environment, versus hands-on file editing, parsing, and
-execution in a code-native environment. That distinction mattered: it kept high-level design
-decisions separate from low-level implementation, a separation that became a theme of the whole
-project.
-
-My dissatisfaction was simple: **the bot "knew" things only because I had typed them in.** I wanted
-it to *learn* — to answer questions from real data, powered by an LLM, not from dictionaries I had
-to maintain by hand.
+The objective was to replace that static knowledge with a system that *learns from data*: parse the community's own match replays, extract per-player behavioural telemetry, and use language models to turn that telemetry into readable strategic profiles the bot can reason about in real time. The design constraint throughout was cost and latency discipline — the system had to be effectively free to run on a single workstation plus a free cloud tier.
 
 ---
 
-## 2. What was originally planned
+## 2. System architecture
 
-The first plan was modest: **replace the hardcoded knowledge with live Gemini API calls.** Swap a
-dictionary lookup for a model call and let the LLM answer strategy questions.
+The system is organized into two tiers with deliberately different economics:
 
-That plan survived contact with reality for about one design pass, because it contained a
-conceptual error I had to confront early (see §4.1). The real project — the one worth building —
-turned out to be far more interesting.
-
----
-
-## 3. How the plan evolved
-
-The idea grew, in stages, into a **"Deep Behavioral Profiling Engine"**: a system that parses a
-player's replay files, extracts granular in-game telemetry, and uses LLMs to build an **evolving,
-plain-English psychological/strategic profile** of each player — which the bot can then answer
-questions about in real time.
-
-The architecture settled into a deliberately **two-tier LLM design**:
+- **Synthesis tier (local, batch, latency-tolerant).** New replays are parsed by deterministic Python and staged in a vector store; a local LLM (Ollama) interprets that telemetry overnight into per-player profiles. This work is free and private, and never blocks a user.
+- **Live tier (cloud, interactive, cost-sensitive).** In Discord, the bot reads the pre-computed profile and reference data, and makes a single grounded call to a cloud LLM (Gemini) for a fast, contextual answer.
 
 ```
-DAYTIME CAPTURE   New replay appears → deterministic Python parser extracts telemetry
-   (no API cost)  → staged in a vector DB (ChromaDB), tagged "unprocessed"
-
-NIGHTLY SYNTHESIS Batch job feeds unprocessed telemetry to a LOCAL LLM (Ollama, free, offline)
-   (while I sleep) → it interprets the timings and rewrites each player's profile.txt
-                     only if something meaningfully changed
-
-DAYTIME QUERY     User asks in Discord → bot reads the pre-compiled profile.txt directly
-   (cheap, fast)  → injects it into ONE cloud LLM call (Gemini) → deep, instant answer
+Replays ──► Pipeline 1: ingest ──► ChromaDB
+                                      │
+                     Pipeline 2: telemetry (Ollama) ──► DynamoDB
+                                      │
+                     Pipeline 3: profiles (Ollama) ──► MinIO / S3
+                                                          │
+Discord ◄──► bot.py ──► Gemini (live answers, grounded in profiles + rules)
 ```
 
-The reasoning behind the split is the part I'm proudest of: **expensive cloud tokens are spent only
-at query time on tiny, pre-digested context, while the heavy interpretive work is done for free
-overnight on local hardware.** Cost and latency drove the architecture, not the other way around.
+The guiding principle is that expensive cloud tokens are spent only at query time, on small pre-digested context, while the heavy interpretive work is amortized to free local compute. The separation of *deterministic decoding* from *probabilistic interpretation* — Python decodes, the model reasons — is the backbone of the design.
 
 ---
 
-## 4. Problems faced — and how I tackled them
+## 3. Key engineering challenges
 
-### 4.1 "Use the LLM to read the files" — a category error
-**Problem:** My initial instinct was to have Gemini decode the binary replay files.
-**Insight:** An LLM is the wrong tool for parsing binary — it's unreliable, expensive, and
-unnecessary. Decoding is a *deterministic* job; *interpretation* is the LLM's job.
-**Resolution:** I split the system cleanly: **Python decodes, the LLM reasons.** This separation of
-concerns became the backbone of the entire architecture.
+### 3.1 Reverse-engineering an unreadable replay format
 
-### 4.2 Polluted data with a hidden lineage
-**Problem:** The bot was scanning two save folders; the cached player profiles were silently built
-from 4 old, off-version files instead of my real 24 competitive games.
-**Resolution:** I traced the data lineage (every cached profile's "last seen" date mapped back to
-the excluded files), narrowed the scanner to the correct folder, and reset the poisoned cache —
-then confirmed the rebuild logic would regenerate cleanly. **Lesson internalized: always verify
-where your data actually came from before trusting it.**
+The community's `.mgz` files are Voobly UserPatch `VER 9.F` recordings, and the standard `mgz` Python library fails to parse them. The first step was ruling out the alarming explanation — that the files were DRM-locked — by confirming the headers decompress cleanly with standard deflate to a readable version string. This was a parser/mod-version mismatch, not encryption.
 
-### 4.3 The replay files were unreadable — the central challenge
-**Problem:** The standard `mgz` Python library **failed on every one of my 24 files** with a cryptic
-parser error. These were Voobly/UserPatch **`VER 9.F`** recordings.
-**Diagnosis:** I first ruled out the scary explanation — was this DRM/encryption locking the files
-to Voobly? I proved it wasn't: the file headers decompressed cleanly with standard deflate to a
-readable `VER 9.F` version string. **Not encryption — a parser/mod-version mismatch.** The library's
-*structured header* parser choked on the mod's altered data layout.
-**Resolution — multi-angle, resource-aware:** Rather than guess, I ran a **3-way race**: three
-independent agents attacking the same single test file with different strategies (library upgrade,
-alternate parser APIs, raw byte-level reverse-engineering) — **in the background, so I could halt the
-losers the instant one succeeded**, saving compute. The winner bypassed the broken high-level parser
-entirely and walked the file's **body** at the byte level using the library's low-level `fast`
-module, accumulating `SYNC` time-ops for the game clock and reading the authoritative `POSTGAME`
-block for the result. **A problem the official tooling declared impossible, solved by dropping one
-level of abstraction.**
+The solution bypassed the library's structured high-level parser and walked the file's command **body** at the byte level using its low-level primitives — accumulating time-synchronization operations for the game clock and reading the authoritative post-game block for the result. A second pass recovered per-player names, civilizations, colors, and spawn positions directly from the decompressed header, fields the high-level parser returns as null. A capability the official tooling reports as impossible was achieved by dropping one level of abstraction.
 
-### 4.4 Ambition vs. physics — what a replay can actually tell you
-**Problem:** The profiling vision called for rich telemetry: villager-on-stone counts, "first unit
-entering enemy line of sight," exact army positioning.
-**Insight:** A replay is a **command log** — it records what players *clicked*, never the game's
-*outcomes* (resources, unit positions, vision, kills). Half the wishlist would require simulating
-the entire game engine.
-**Resolution:** Instead of designing on hope, I **empirically probed my real files** to see what
-data physically existed, then ran a structured pipeline to classify every desired signal as
-**extractable / workaround / not-feasible** — grounded in evidence, not optimism. I also discovered
-an anomaly (the `RESEARCH` action was 100% absent, so age-up timing was unavailable) and adapted the
-design to use **time-based game phases** instead. **Choosing to confront the constraints early,
-honestly, is what kept the project buildable.**
+### 3.2 Feasibility-driven scoping
 
-### 4.5 Turning a vague wish-list into a ranked, validated spec
-**Problem:** "Record everything interesting" is not a specification.
-**Resolution:** I orchestrated a **7-agent pipeline**: five low-cost agents brainstormed ~197 telemetry
-ideas across distinct domains (economy, military, defense, map control, psychology); a mid-tier agent
-**deduplicated and ranked** them by significance into 92 tiered signals; a final agent **classified
-each by technical feasibility** against my probe evidence. Output: a defensible, prioritized spec
-with a clear "reliable spine" of ~14 directly-extractable signals plus strong proxies.
+A replay is a **command log**: it records what players clicked, not the game's outcomes (resource counts, unit positions, kills). Rather than design against hope, every desired telemetry signal was empirically probed against real files and classified as directly extractable, recoverable via proxy, or not feasible. An observed anomaly — one action type absent entirely — was handled by switching age-progression estimates to time-based game phases. Confronting the data's limits early kept the system buildable and its claims honest.
 
-### 4.6 Don't lose the work
-**Problem:** Critical analysis was living only in a chat transcript.
-**Resolution:** I had it all written to durable, version-controllable documents (`TELEMETRY_PLAN.md`,
-this case study) so the project's state survives independently of any one tool or session.
+### 3.3 Retrieval-augmented grounding for a non-standard ruleset
+
+Once live answers came from Gemini, a subtle failure surfaced: the model gave textbook Age of Empires II advice — early-game villager counts, standard age-up timings — none of which apply to this server's custom Imperial-Age-start ruleset. The model knew vanilla strategy from its training data and had never encountered this meta.
+
+The fix was retrieval-augmented grounding. Every answer prompt now carries structured, server-specific reference data — exact starting resources, building costs, and production rates — together with the relevant player profiles, injected via tagged context blocks. The model reasons from the server's actual numbers rather than its priors, and command handlers route through a single grounding layer so behaviour is consistent across every feature.
+
+### 3.4 Decrypting Discord's mandatory end-to-end-encrypted voice
+
+A goal was conversational voice: a user speaks a wake word and a question in a voice channel and hears a spoken answer. The receive path presented a substantial obstacle. Stock discord.py cannot receive voice at all, which a community extension addresses; but every received audio frame then decoded to noise.
+
+The cause was **DAVE**, Discord's MLS-based end-to-end voice encryption, which the platform made mandatory in 2026 — non-participating clients are refused at connection time. The bot therefore could not opt out of encryption; it had to decrypt it. Because the bot is a full member of the encrypted voice group, it holds the group's media keys. The receive pipeline was hooked to decrypt each frame with the live session before audio decode, and to drop the occasional undecryptable transition frame rather than fault the stream. In live testing this decrypted the overwhelming majority of frames cleanly and produced accurate transcripts. Speech output (text-to-speech) and wake-word handling were tuned against real transcripts, including accent- and onset-clipping variants observed in practice.
+
+### 3.5 Player attribution, measured honestly
+
+Unit-production commands in this replay format carry no player identifier, so "who built this army" is not directly recorded. The system builds an ownership ledger from the minority of commands that *do* carry identity, attributing production to a building only when the evidence is unambiguous and discarding any object with conflicting claims rather than guessing.
+
+Critically, the coverage of this mechanism was measured across the full replay corpus rather than a convenient sample: an early three-file estimate of ~18–22% was corrected to a true ~9% once every game was analyzed, and the lower figure is the one reported. The value of the result is inseparable from the rigor of its measurement.
 
 ---
 
-## 5. Working knowledge I gained
+## 4. Engineering practices
 
-**Reverse-engineering & binary formats**
-- The structure of AoE II `.mgz` recorded games: compressed header + uncompressed body of
-  time-synchronized command operations; deflate decompression, length-prefixed sections,
-  byte-stream walking.
-- How to drop below a failing high-level API to a low-level one when an abstraction breaks.
-- Distinguishing *encryption* from *compression* from *version mismatch* by evidence.
-
-**LLM application architecture**
-- When **not** to use an LLM (deterministic parsing) vs. when it shines (interpretation, synthesis).
-- **Two-tier LLM design**: local model (Ollama) for free, latency-tolerant batch work; cloud model
-  (Gemini) for cheap, fast, pre-contextualized queries.
-- Retrieval/RAG concepts and **vector databases (ChromaDB)** — including the judgment that in v1 it
-  functions as a tagged staging queue, not a semantic search store.
-- The "pre-compute the expensive thinking, inject a small context at query time" cost pattern.
-
-**Data engineering**
-- An incremental ETL pipeline: detect new files → parse → stage with `processed` flags →
-  batch-transform → update derived artifacts; designed for a folder that grows over time.
-- Scheduled/offline processing (a nightly batch decoupled from the live service).
-- Data-lineage tracing and cache invalidation.
-
-**Systems & tooling**
-- discord.py bot architecture: commands, embeds, intents, voice/TTS, async offloading of CPU-bound work.
-- Hardware-aware ML deployment: recognizing that an AMD RDNA1 GPU (5600 XT) won't accelerate Ollama
-  under ROCm, so the local model runs on CPU — acceptable precisely because it's an overnight batch.
-- **Multi-agent orchestration**: distributing work across model tiers by cost, running competing
-  approaches in parallel, and halting redundant work on first success.
+- **Two-tier, cost-aware model selection.** Local models for free, latency-tolerant batch synthesis; a cheap cloud model for fast, pre-contextualized live queries; work distributed by cost rather than defaults.
+- **Verification over trust.** Data-producing stages and reported findings were independently confirmed against the actual datastores before being relied upon — a discipline that caught real issues, including a data-lineage bug where profiles had been built from the wrong replay folder, and duplicate records introduced by re-running a stage after its keying logic changed.
+- **Testing and CI.** A pytest suite covers the pure, deterministic core — wake-word matching, audio conversion, the attribution ledger's conflict handling, and the civilization-id lookup — and runs on every push via GitHub Actions.
+- **Reproducible deployment.** The live bot is containerized (Docker) with a documented deployment path to a free always-on cloud VM; the heavy local synthesis remains on a workstation and publishes results to the shared store.
+- **Durable documentation.** Design decisions, the telemetry specification, and the reverse-engineering research are captured in version-controlled documents so the project's state survives independently of any single tool or session.
 
 ---
 
-## 6. My approach to problem-solving & architecture
+## 5. Current state
 
-A few principles I demonstrated repeatedly, and now hold deliberately:
-
-1. **Separation of concerns.** Deterministic work and probabilistic work are different tools.
-   Decode with code; reason with the model. Most of the architecture fell out of this one line.
-2. **Right tool for the job, costed.** Local vs. cloud LLM, vector DB vs. simple queue, GPU vs. CPU —
-   each chosen against real constraints (price, latency, hardware), not defaults.
-3. **Validate before you commit.** I probed the actual files before designing on top of them, and
-   classified every feature by real feasibility. I would rather kill a feature early than discover
-   mid-build that the data never existed.
-4. **Confront constraints honestly.** When the data couldn't support half the vision, I said so and
-   rescoped — a buildable 60% beats an imaginary 100%.
-5. **Manage resources deliberately.** Parallel investigation, then halt the losers. Cheap models for
-   breadth, capable models for judgment.
-6. **Make the work durable.** Decisions and findings go into documents, not just memory.
+The bot is live and answers strategy, economy, build-order, matchup, and free-form questions grounded in real player data; it joins voice channels to both speak coaching and listen for spoken questions; and it recaps recorded games. The full replay pipeline runs end-to-end into ChromaDB, DynamoDB, and MinIO. The codebase is tested in CI and deployable to a free cloud tier. Ongoing work concerns the hardest open sub-problem — raising per-player attribution coverage — for which a promising starting-Town-Center heuristic has been identified and is pending a single labelled validation game.
 
 ---
 
-## 7. The second act — from research to a shipped, deployed system
+## 6. Skills demonstrated
 
-The sections above were written at the end of the research phase. Then I built it.
-Three problems from the build stand out.
-
-### 7.1 Grounding: stopping the LLM from giving generic advice
-Once live Gemini answers replaced the hardcoded dictionaries, a subtle failure
-appeared: the model gave *textbook* Age of Empires II advice — Dark-Age villager
-counts, Feudal-Age timings — none of which exist on this server's custom
-Imperial-Age-start ruleset. The model knew vanilla AoE2 from its training data
-and had never heard of our meta. **Fix: retrieval-augmented grounding.** Every
-answer prompt now carries server-specific reference data — exact starting
-resources, building costs, production math — plus the asking context's player
-profiles. The model reasons *from our numbers*, not its priors. (`cloud_llm.py`,
-`reference_data/`, `reference_loader.py`.)
-
-### 7.2 The E2EE voice saga — the second format I had to crack
-I wanted the bot to *listen*: say "Teletron, how do I beat a knight rush?" in
-voice and get a spoken answer. The receive side broke in a way that took real
-debugging. First, `discord.py` can't natively receive voice at all — I added a
-community extension. Then every audio frame decoded to garbage ("corrupted
-stream"). I traced it, ruling out theories one by one, to **DAVE** — Discord's
-new MLS-based end-to-end encryption. As of March 2026 the platform *mandates* it
-and rejects clients that opt out with close code `4017`; I confirmed this by
-trying to disable DAVE and watching the connection get refused. So the bot
-*couldn't* avoid E2EE — it had to actually decrypt it. Because the bot is a full
-member of the encrypted voice group, it holds the session keys; I hooked the
-receive pipeline to decrypt each frame with the live DAVE session before Opus
-decode. Result: **330 of 333 frames decrypted cleanly** in live testing, the
-three undecryptable transition frames dropped instead of crashing the reader.
-The same instinct as the replay format — *drop a level, understand the real
-wire format, don't fight the abstraction.*
-
-### 7.3 Ownership inference — and choosing the honest number
-The format never records *which player* produced a given unit. I built a
-"proof ledger": the few command types that carry a player identity attribute
-ownership to the buildings they touch, and unit production from a proven building
-inherits that owner — with a hard rule that **any object with conflicting
-evidence is discarded, never guessed.** An early sample of three files suggested
-~18-22% of production was attributable, which was encouraging. Then I ran the
-analysis across the *full* corpus and it came back at **~9%** (lower on big team
-games). I reported the 9%. The temptation in a portfolio piece is to quote the
-flattering sample; the engineering value is in the correction — a coverage claim
-is only worth what the full data says, and saying so is the job. (`replay_parser.py`,
-`docs/OWNERSHIP_RESEARCH.md`.)
-
-### 7.4 Deployment
-The system splits cleanly along its own two tiers: the light, always-on **bot**
-is containerized (`Dockerfile`, `deploy/`) and runs 24/7 on a free cloud VM,
-while the heavy **local-LLM synthesis** stays on a workstation and pushes
-profiles up. The machine that trains the profiles can be asleep; the bot never is.
-
----
-
-## 8. What completing this prepares me to build
-
-The skills exercised here transfer directly to:
-
-- **LLM / RAG application engineering** — production systems that combine deterministic data
-  pipelines with LLM reasoning, with real cost and latency budgets.
-- **Data engineering / ETL platforms** — incremental ingestion, staging, scheduled transformation,
-  and lineage-aware data hygiene.
-- **Game & esports analytics** — replay parsing, telemetry extraction, and player/behavioral modeling
-  (a real and growing industry).
-- **Reverse-engineering & interoperability** — reading undocumented or version-mismatched binary
-  formats when official tooling falls short.
-- **Multi-agent / agentic AI systems** — orchestrating tiered models for cost-effective automation.
-- **Behavioral analytics** generally — turning granular event logs into human-readable, evolving
-  profiles.
-
----
-
-## 9. Closing reflection
-
-The most valuable thing this project taught me isn't a library or an API — it's a **way of working**:
-start with an ambitious vision, pressure-test it against reality early and honestly, separate the
-deterministic from the probabilistic, choose every component against real constraints, and document
-the journey so the knowledge compounds. The headline result — reverse-engineering a replay format the
-standard tools couldn't read — is satisfying. But the discipline that produced it is the part I'd
-bring to any team.
-
----
-
-*Companion document: `age of empire discord bot/TELEMETRY_PLAN.md` — the full technical spec, the
-92-signal feasibility catalogue, and the working parser code.*
+- **LLM / RAG application engineering** — production systems combining deterministic data pipelines with grounded LLM reasoning under real cost and latency budgets.
+- **Data engineering** — incremental ingestion, staged transformation, scheduled batch synthesis, and lineage-aware data hygiene across a vector store, a NoSQL store, and object storage.
+- **Reverse-engineering and interoperability** — recovering structured data from an undocumented, version-mismatched binary format and a mandatory encryption layer.
+- **Real-time systems** — low-level audio handling, live decryption, and thread-to-event-loop coordination in an asynchronous service.
+- **Engineering judgment** — feasibility-driven scoping, empirical measurement of one's own results, cost-conscious architecture, and test/CI discipline.
