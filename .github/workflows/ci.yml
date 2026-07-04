@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: System deps (voice libs used at import)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libopus0
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "age of empire discord bot/requirements.txt" -r requirements-dev.txt
+          # Imported by the code but not pinned in the bot's requirements:
+          pip install requests boto3 audioop-lts
+
+      - name: Compile-check key modules
+        run: |
+          python -m py_compile \
+            "age of empire discord bot/bot.py" \
+            "age of empire discord bot/voice_listen.py" \
+            "age of empire discord bot/cloud_llm.py" \
+            "age of empire discord bot/reference_loader.py" \
+            pipeline/replay_parser.py \
+            pipeline/civ_ids.py
+
+      - name: Run tests
+        run: pytest -q

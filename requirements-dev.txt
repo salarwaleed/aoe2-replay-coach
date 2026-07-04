@@ -1,0 +1,2 @@
+# Test/CI dependencies (installed on top of the bot's requirements.txt).
+pytest>=8.0
